@@ -1,0 +1,238 @@
+import { relations, sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  index,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  unique,
+  uuid,
+} from "drizzle-orm/pg-core";
+
+// Livrable 1: data model for Invoice, Invoice_items, Payment, Tax.
+// All money is stored in cents (integer) and all rates in micros of the
+// decimal fraction (integer, divisor 1_000_000) — see requis doc section 7.3.
+// Example: 9.975% => fraction 0.09975 => rateMicros 99750.
+//
+// This file is the single source of truth for the schema: run
+// `npx drizzle-kit generate` after editing it to produce the SQL migration
+// under drizzle/migrations, and `npx drizzle-kit push` (or apply the
+// generated SQL) once a real DATABASE_URL is available.
+
+export type InvoiceStatus =
+  | "draft"
+  | "unpaid"
+  | "partially_paid"
+  | "paid"
+  | "refunded"
+  | "voided";
+
+export type InvoiceItemType = "service" | "product";
+
+export type DiscountType = "none" | "amount" | "percent";
+
+export type PaymentMethod =
+  | "cash"
+  | "credit_card"
+  | "debit_card"
+  | "interac"
+  | "square"
+  | "gift_card"
+  | "package"
+  | "store_credit";
+
+export type PaymentStatus = "pending" | "completed" | "refunded" | "voided";
+
+export type TaxAppliesTo = "services" | "products" | "both";
+
+// 5. Tax profiles (Paramètres > Taxes)
+export const taxes = pgTable(
+  "taxes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    rateMicros: integer("rate_micros").notNull(),
+    country: text("country").notNull().default("CA"),
+    region: text("region"), // null = applies to all regions of the country
+    appliesTo: text("applies_to").notNull().default("both").$type<TaxAppliesTo>(),
+    includedInPrice: boolean("included_in_price").notNull().default(false),
+    calculationOrder: integer("calculation_order").notNull().default(1), // lets TVQ compute on the pre-TPS subtotal
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("taxes_rate_micros_check", sql`${table.rateMicros} >= 0`),
+    check("taxes_applies_to_check", sql`${table.appliesTo} in ('services', 'products', 'both')`),
+  ]
+);
+
+// 4.2 / 4.3 Invoice header
+export const invoices = pgTable(
+  "invoices",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceNumber: text("invoice_number").notNull(), // e.g. INV-2026-00412
+    status: text("status").notNull().default("draft").$type<InvoiceStatus>(),
+
+    // Customer/appointment modules are out of scope for this livrable; keep a
+    // loose reference plus a denormalized snapshot so the invoice still reads
+    // correctly even if those rows change or don't exist yet.
+    customerId: uuid("customer_id"),
+    customerName: text("customer_name"),
+    appointmentId: uuid("appointment_id"),
+
+    subtotalCents: integer("subtotal_cents").notNull().default(0),
+    taxTotalCents: integer("tax_total_cents").notNull().default(0),
+    tipCents: integer("tip_cents").notNull().default(0),
+    totalCents: integer("total_cents").notNull().default(0),
+
+    notesInternal: text("notes_internal"),
+    notesCustomer: text("notes_customer"),
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    voidedAt: timestamp("voided_at", { withTimezone: true }),
+  },
+  (table) => [
+    unique("invoices_invoice_number_key").on(table.invoiceNumber),
+    index("invoices_status_idx").on(table.status),
+    index("invoices_customer_id_idx").on(table.customerId),
+    check(
+      "invoices_status_check",
+      sql`${table.status} in ('draft', 'unpaid', 'partially_paid', 'paid', 'refunded', 'voided')`
+    ),
+  ]
+);
+
+// 4.2 / 4.4 / 7.2 Invoice lines (one per service or product, prices snapshotted)
+export const invoiceItems = pgTable(
+  "invoice_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references(() => invoices.id, { onDelete: "cascade" }),
+    lineNumber: integer("line_number").notNull(),
+
+    itemType: text("item_type").notNull().$type<InvoiceItemType>(),
+    catalogItemId: uuid("catalog_item_id"), // loose reference to the future services/products catalog
+    description: text("description").notNull(), // snapshot: name at time of sale
+
+    employeeId: uuid("employee_id"),
+    employeeName: text("employee_name"), // snapshot: needed for commission reports even if employee is later renamed/removed
+
+    quantity: integer("quantity").notNull().default(1),
+    unitPriceCents: integer("unit_price_cents").notNull(), // snapshot: price at time of sale
+
+    discountType: text("discount_type").notNull().default("none").$type<DiscountType>(),
+    discountAmountCents: integer("discount_amount_cents").notNull().default(0), // used when discountType = 'amount'
+    discountPercentMicros: integer("discount_percent_micros").notNull().default(0), // used when discountType = 'percent'
+
+    packageRedemptionId: uuid("package_redemption_id"), // set when this line was covered by a pre-sold package instead of charged (4.10)
+
+    tipCents: integer("tip_cents").notNull().default(0), // this line's employee's share of the invoice tip (4.6)
+    subtotalCents: integer("subtotal_cents").notNull(), // (quantity * unitPriceCents) - discount, before tax
+    taxAmountCents: integer("tax_amount_cents").notNull().default(0), // sum of invoiceItemTaxes for this line
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("invoice_items_invoice_id_line_number_key").on(table.invoiceId, table.lineNumber),
+    index("invoice_items_invoice_id_idx").on(table.invoiceId),
+    check("invoice_items_item_type_check", sql`${table.itemType} in ('service', 'product')`),
+    check(
+      "invoice_items_discount_type_check",
+      sql`${table.discountType} in ('none', 'amount', 'percent')`
+    ),
+    check("invoice_items_quantity_check", sql`${table.quantity} > 0`),
+  ]
+);
+
+// 7.2 Per-line tax breakdown, snapshotted so later rate changes don't rewrite history
+export const invoiceItemTaxes = pgTable(
+  "invoice_item_taxes",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceItemId: uuid("invoice_item_id")
+      .notNull()
+      .references(() => invoiceItems.id, { onDelete: "cascade" }),
+    taxId: uuid("tax_id").references(() => taxes.id), // loose reference to the profile that produced this line
+    taxName: text("tax_name").notNull(), // snapshot
+    taxRateMicros: integer("tax_rate_micros").notNull(), // snapshot
+    calculationOrder: integer("calculation_order").notNull().default(1),
+    taxAmountCents: integer("tax_amount_cents").notNull(),
+  },
+  (table) => [index("invoice_item_taxes_invoice_item_id_idx").on(table.invoiceItemId)]
+);
+
+// 4.7 / 4.8 Payments (one invoice can have several, i.e. split payment)
+export const payments = pgTable(
+  "payments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references(() => invoices.id, { onDelete: "cascade" }),
+    method: text("method").notNull().$type<PaymentMethod>(),
+    status: text("status").notNull().default("completed").$type<PaymentStatus>(),
+
+    amountCents: integer("amount_cents").notNull(),
+    amountTenderedCents: integer("amount_tendered_cents"), // cash/interac: what the client handed over
+    changeGivenCents: integer("change_given_cents"), // cash/interac: change returned
+
+    reference: text("reference"), // gift card code, external transaction id, etc.
+
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("payments_invoice_id_idx").on(table.invoiceId),
+    check(
+      "payments_method_check",
+      sql`${table.method} in ('cash', 'credit_card', 'debit_card', 'interac', 'square', 'gift_card', 'package', 'store_credit')`
+    ),
+    check(
+      "payments_status_check",
+      sql`${table.status} in ('pending', 'completed', 'refunded', 'voided')`
+    ),
+    check("payments_amount_cents_check", sql`${table.amountCents} > 0`),
+  ]
+);
+
+export const taxesRelations = relations(taxes, ({ many }) => ({
+  invoiceItemTaxes: many(invoiceItemTaxes),
+}));
+
+export const invoicesRelations = relations(invoices, ({ many }) => ({
+  items: many(invoiceItems),
+  payments: many(payments),
+}));
+
+export const invoiceItemsRelations = relations(invoiceItems, ({ one, many }) => ({
+  invoice: one(invoices, {
+    fields: [invoiceItems.invoiceId],
+    references: [invoices.id],
+  }),
+  taxes: many(invoiceItemTaxes),
+}));
+
+export const invoiceItemTaxesRelations = relations(invoiceItemTaxes, ({ one }) => ({
+  invoiceItem: one(invoiceItems, {
+    fields: [invoiceItemTaxes.invoiceItemId],
+    references: [invoiceItems.id],
+  }),
+  tax: one(taxes, {
+    fields: [invoiceItemTaxes.taxId],
+    references: [taxes.id],
+  }),
+}));
+
+export const paymentsRelations = relations(payments, ({ one }) => ({
+  invoice: one(invoices, {
+    fields: [payments.invoiceId],
+    references: [invoices.id],
+  }),
+}));
