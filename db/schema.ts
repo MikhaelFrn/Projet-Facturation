@@ -99,6 +99,13 @@ export const invoices = pgTable(
   },
   (table) => [
     unique("invoices_invoice_number_key").on(table.invoiceNumber),
+    // Postgres treats NULLs as distinct from each other in a unique
+    // constraint, so this only blocks a *second* invoice for the same
+    // appointment — invoices with no appointment (appointmentId null) are
+    // unaffected. Backstops the application-level check in
+    // createInvoiceFromAppointment() against a race between the read and
+    // the insert.
+    unique("invoices_appointment_id_key").on(table.appointmentId),
     index("invoices_status_idx").on(table.status),
     index("invoices_customer_id_idx").on(table.customerId),
     check(
@@ -201,6 +208,15 @@ export const payments = pgTable(
     check("payments_amount_cents_check", sql`${table.amountCents} > 0`),
   ]
 );
+
+// Backs generateInvoiceNumber() (features/invoicing/invoice-number.ts): one
+// row per calendar year, incremented atomically via an upsert so concurrent
+// checkouts never get the same number. Produces INV-{year}-{lastValue,
+// zero-padded to 5 digits}, e.g. INV-2026-00412.
+export const invoiceNumberCounters = pgTable("invoice_number_counters", {
+  year: integer("year").primaryKey(),
+  lastValue: integer("last_value").notNull().default(0),
+});
 
 export const taxesRelations = relations(taxes, ({ many }) => ({
   invoiceItemTaxes: many(invoiceItemTaxes),
