@@ -29,6 +29,13 @@
       "when": 1789577666093,
       "tag": "0003_equal_plazm",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789578310346,
+      "tag": "0004_strong_star_brand",
+      "breakpoints": true
     }
   ]
 }

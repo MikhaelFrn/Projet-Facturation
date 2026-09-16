@@ -193,6 +193,10 @@ export const invoiceItemTaxes = pgTable(
     taxId: uuid("tax_id").references(() => taxes.id), // loose reference to the profile that produced this line
     taxName: text("tax_name").notNull(), // snapshot
     taxRateMicros: integer("tax_rate_micros").notNull(), // snapshot
+    // Livrable 3: snapshotted so updateInvoiceItem can reprice a line (new
+    // quantity/discount) using the SAME tax rules that applied when the line
+    // was added, without re-reading (and trusting) the current taxes table.
+    taxIncludedInPrice: boolean("tax_included_in_price").notNull().default(false),
     calculationOrder: integer("calculation_order").notNull().default(1),
     taxAmountCents: integer("tax_amount_cents").notNull(),
   },

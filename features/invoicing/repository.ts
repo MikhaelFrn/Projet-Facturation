@@ -11,13 +11,20 @@ import {
   AppointmentNotCompletedError,
   AppointmentNotFoundError,
   CatalogItemNotFoundError,
+  InvoiceItemNotFoundError,
   InvoiceNotEditableError,
   InvoiceNotFoundError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
 import { getMockInvoiceById, mockInvoices, mockTaxes } from "./mock-data";
-import { calculateLineTaxes, computeLineGrossAmountCents, selectApplicableTaxes } from "./tax-calculation";
-import type { InvoiceItem, InvoiceItemTax, InvoiceStatus, InvoiceWithDetails, Tax } from "./types";
+import {
+  calculateLineTaxes,
+  computeLineGrossAmountCents,
+  selectApplicableTaxes,
+  taxRateInputsFromSnapshot,
+  type LineTaxCalculation,
+} from "./tax-calculation";
+import type { DiscountType, InvoiceItem, InvoiceItemTax, InvoiceStatus, InvoiceWithDetails, Tax } from "./types";
 
 // 7.1: a closed invoice can never be modified directly. Extended past the
 // doc's literal "paid" example to partially_paid too — editing a line after
@@ -140,6 +147,7 @@ async function createInvoiceFromAppointmentMock(appointment: Appointment): Promi
         taxId: tax.taxId,
         taxName: tax.taxName,
         taxRateMicros: tax.taxRateMicros,
+        taxIncludedInPrice: tax.taxIncludedInPrice,
         calculationOrder: tax.calculationOrder,
         taxAmountCents: tax.taxAmountCents,
       })),
@@ -238,6 +246,7 @@ async function createInvoiceFromAppointmentReal(appointment: Appointment): Promi
           taxId: tax.taxId,
           taxName: tax.taxName,
           taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
           calculationOrder: tax.calculationOrder,
           taxAmountCents: tax.taxAmountCents,
         }));
@@ -409,6 +418,7 @@ function addInvoiceItemMock(
       taxId: tax.taxId,
       taxName: tax.taxName,
       taxRateMicros: tax.taxRateMicros,
+      taxIncludedInPrice: tax.taxIncludedInPrice,
       calculationOrder: tax.calculationOrder,
       taxAmountCents: tax.taxAmountCents,
     })),
@@ -472,6 +482,7 @@ async function addInvoiceItemReal(
           taxId: tax.taxId,
           taxName: tax.taxName,
           taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
           calculationOrder: tax.calculationOrder,
           taxAmountCents: tax.taxAmountCents,
         }))
@@ -484,6 +495,139 @@ async function addInvoiceItemReal(
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after adding a line`);
+  }
+  return updated;
+}
+
+export interface UpdateInvoiceItemInput {
+  quantity?: number;
+  discountType?: DiscountType;
+  discountAmountCents?: number;
+  discountPercentMicros?: number;
+}
+
+interface ResolvedLineUpdate {
+  quantity: number;
+  discountType: DiscountType;
+  discountAmountCents: number;
+  discountPercentMicros: number;
+  taxCalc: LineTaxCalculation;
+}
+
+// 4.4: change a line's quantity and/or discount on an open invoice. Reprices
+// against the SAME taxes that applied when the line was added (taxRateInputsFromSnapshot),
+// not whatever the taxes table says today — see db/schema.ts's
+// taxIncludedInPrice comment for why that distinction matters.
+export async function updateInvoiceItem(
+  invoiceId: string,
+  itemId: string,
+  input: UpdateInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const currentItem = invoice.items.find((item) => item.id === itemId);
+  if (!currentItem) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+
+  const quantity = input.quantity ?? currentItem.quantity;
+  const discountType = input.discountType ?? currentItem.discountType;
+  // Switching discount type clears the field that no longer applies, rather
+  // than leaving a stale amount/percent sitting unused on the row.
+  const discountAmountCents =
+    discountType === "amount" ? (input.discountAmountCents ?? currentItem.discountAmountCents) : 0;
+  const discountPercentMicros =
+    discountType === "percent" ? (input.discountPercentMicros ?? currentItem.discountPercentMicros) : 0;
+
+  const grossAmountCents = computeLineGrossAmountCents({
+    quantity,
+    unitPriceCents: currentItem.unitPriceCents,
+    discountType,
+    discountAmountCents,
+    discountPercentMicros,
+  });
+  const taxCalc = calculateLineTaxes(grossAmountCents, taxRateInputsFromSnapshot(currentItem.taxes));
+
+  const resolved: ResolvedLineUpdate = { quantity, discountType, discountAmountCents, discountPercentMicros, taxCalc };
+
+  if (!isDatabaseConfigured) {
+    return updateInvoiceItemMock(invoice, currentItem, resolved);
+  }
+  return updateInvoiceItemReal(invoiceId, itemId, resolved);
+}
+
+function updateInvoiceItemMock(
+  invoice: InvoiceWithDetails,
+  item: InvoiceItem & { taxes: InvoiceItemTax[] },
+  next: ResolvedLineUpdate
+): InvoiceWithDetails {
+  item.quantity = next.quantity;
+  item.discountType = next.discountType;
+  item.discountAmountCents = next.discountAmountCents;
+  item.discountPercentMicros = next.discountPercentMicros;
+  item.subtotalCents = next.taxCalc.subtotalCents;
+  item.taxAmountCents = next.taxCalc.taxAmountCents;
+  item.taxes = next.taxCalc.taxes.map((tax) => ({
+    id: randomUUID(),
+    invoiceItemId: item.id,
+    taxId: tax.taxId,
+    taxName: tax.taxName,
+    taxRateMicros: tax.taxRateMicros,
+    taxIncludedInPrice: tax.taxIncludedInPrice,
+    calculationOrder: tax.calculationOrder,
+    taxAmountCents: tax.taxAmountCents,
+  }));
+
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function updateInvoiceItemReal(
+  invoiceId: string,
+  itemId: string,
+  next: ResolvedLineUpdate
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    await tx
+      .update(invoiceItems)
+      .set({
+        quantity: next.quantity,
+        discountType: next.discountType,
+        discountAmountCents: next.discountAmountCents,
+        discountPercentMicros: next.discountPercentMicros,
+        subtotalCents: next.taxCalc.subtotalCents,
+        taxAmountCents: next.taxCalc.taxAmountCents,
+      })
+      .where(eq(invoiceItems.id, itemId));
+
+    await tx.delete(invoiceItemTaxes).where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+
+    if (next.taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        next.taxCalc.taxes.map((tax) => ({
+          invoiceItemId: itemId,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after updating a line`);
   }
   return updated;
 }
