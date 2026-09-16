@@ -1,9 +1,33 @@
-import type { InvoiceItemType, Tax } from "./types";
+import type { DiscountType, InvoiceItemType, Tax } from "./types";
 
 const MICROS = 1_000_000;
 
 function roundCents(value: number): number {
   return Math.round(value);
+}
+
+// Livrable 3 (4.4): quantity and discount only exist for lines added/edited
+// after invoice creation — appointment-derived lines from createInvoiceFromAppointment
+// are always qty 1 / no discount, which is why this wasn't needed until now.
+// Pure calculator only: quantity/amount validation (e.g. quantity > 0) is the
+// caller's job, enforced at the API boundary and by the DB check constraints.
+export function computeLineGrossAmountCents(params: {
+  quantity: number;
+  unitPriceCents: number;
+  discountType: DiscountType;
+  discountAmountCents: number;
+  discountPercentMicros: number;
+}): number {
+  const rawCents = params.quantity * params.unitPriceCents;
+
+  if (params.discountType === "amount") {
+    return Math.max(0, rawCents - params.discountAmountCents);
+  }
+  if (params.discountType === "percent") {
+    const discountCents = roundCents((rawCents * params.discountPercentMicros) / MICROS);
+    return Math.max(0, rawCents - discountCents);
+  }
+  return rawCents;
 }
 
 export interface LineTaxResult {
