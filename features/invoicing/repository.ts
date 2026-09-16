@@ -631,3 +631,39 @@ async function updateInvoiceItemReal(
   }
   return updated;
 }
+
+// 4.4: "Possibilité de supprimer une ligne (tant que la facture n'est pas
+// fermée)". Line numbers are left with gaps after a removal rather than
+// renumbered — nothing depends on them being contiguous, and renumbering
+// would just be extra writes for no benefit.
+export async function removeInvoiceItem(invoiceId: string, itemId: string): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const itemIndex = invoice.items.findIndex((item) => item.id === itemId);
+  if (itemIndex === -1) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+
+  if (!isDatabaseConfigured) {
+    invoice.items.splice(itemIndex, 1);
+    recalculateMockInvoiceTotals(invoice);
+    return invoice;
+  }
+
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    // invoice_item_taxes rows cascade with the invoice_items row (db/schema.ts).
+    await tx.delete(invoiceItems).where(eq(invoiceItems.id, itemId));
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after removing a line`);
+  }
+  return updated;
+}
