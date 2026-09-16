@@ -30,10 +30,24 @@ export function computeLineGrossAmountCents(params: {
   return rawCents;
 }
 
+// Only the fields calculateLineTaxes actually reads — narrower than the full
+// Tax row so it can be fed either a Tax[] (pricing a brand-new line) or a
+// reconstruction from invoice_item_taxes' own snapshot columns (repricing an
+// existing line in updateInvoiceItem, without re-reading the current taxes
+// table — see db/schema.ts's taxIncludedInPrice comment).
+export interface TaxRateInput {
+  id: string | null; // null when reconstructed from a line whose tax profile reference was already cleared
+  name: string;
+  rateMicros: number;
+  includedInPrice: boolean;
+  calculationOrder: number;
+}
+
 export interface LineTaxResult {
-  taxId: string;
+  taxId: string | null;
   taxName: string;
   taxRateMicros: number;
+  taxIncludedInPrice: boolean;
   calculationOrder: number;
   taxAmountCents: number;
 }
@@ -60,7 +74,7 @@ export interface LineTaxCalculation {
  */
 export function calculateLineTaxes(
   grossAmountCents: number,
-  applicableTaxes: Tax[]
+  applicableTaxes: TaxRateInput[]
 ): LineTaxCalculation {
   const includedTaxes = applicableTaxes.filter((tax) => tax.includedInPrice);
   const addedTaxes = applicableTaxes.filter((tax) => !tax.includedInPrice);
@@ -80,6 +94,7 @@ export function calculateLineTaxes(
       taxId: tax.id,
       taxName: tax.name,
       taxRateMicros: tax.rateMicros,
+      taxIncludedInPrice: tax.includedInPrice,
       calculationOrder: tax.calculationOrder,
       taxAmountCents: roundCents((subtotalCents * tax.rateMicros) / MICROS),
     }));
@@ -91,6 +106,28 @@ export function calculateLineTaxes(
     .reduce((sum, tax) => sum + tax.taxAmountCents, 0);
 
   return { subtotalCents, taxes, taxAmountCents };
+}
+
+// Rebuilds calculateLineTaxes' input from a line's own invoice_item_taxes
+// rows, for updateInvoiceItem: repricing after a quantity/discount change
+// must use the exact tax rules that applied when the line was added, not
+// whatever the taxes table says today.
+export function taxRateInputsFromSnapshot(
+  taxes: {
+    taxId: string | null;
+    taxName: string;
+    taxRateMicros: number;
+    taxIncludedInPrice: boolean;
+    calculationOrder: number;
+  }[]
+): TaxRateInput[] {
+  return taxes.map((tax) => ({
+    id: tax.taxId,
+    name: tax.taxName,
+    rateMicros: tax.taxRateMicros,
+    includedInPrice: tax.taxIncludedInPrice,
+    calculationOrder: tax.calculationOrder,
+  }));
 }
 
 /**
