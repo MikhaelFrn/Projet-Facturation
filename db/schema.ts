@@ -47,6 +47,29 @@ export type PaymentStatus = "pending" | "completed" | "refunded" | "voided";
 
 export type TaxAppliesTo = "services" | "products" | "both";
 
+// Livrable 3: catalog of services/products a réceptionniste can search and
+// add to an invoice (requis doc section 4.4). No other module owns this data
+// (unlike Appointment — see features/appointments/types.ts), so it lives here.
+export const catalogItems = pgTable(
+  "catalog_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sku: text("sku").notNull(),
+    name: text("name").notNull(),
+    itemType: text("item_type").notNull().$type<InvoiceItemType>(),
+    unitPriceCents: integer("unit_price_cents").notNull(),
+    taxExempt: boolean("tax_exempt").notNull().default(false), // requis doc section 5 "Exemptions"
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("catalog_items_sku_key").on(table.sku),
+    index("catalog_items_name_idx").on(table.name),
+    check("catalog_items_item_type_check", sql`${table.itemType} in ('service', 'product')`),
+  ]
+);
+
 // 5. Tax profiles (Paramètres > Taxes)
 export const taxes = pgTable(
   "taxes",
