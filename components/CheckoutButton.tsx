@@ -2,30 +2,34 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { formatCents } from "@/utils/currency";
-
-interface CreatedInvoice {
-  invoiceNumber: string;
-  totalCents: number;
-}
+import type { CatalogItem } from "@/features/catalog/types";
+import type { InvoiceWithDetails } from "@/features/invoicing/types";
+import { InvoiceLineEditor } from "./InvoiceLineEditor";
 
 // Stands in for the "Procéder au paiement" button the real calendar UI will
 // have (requis doc 4.1) — we don't own that UI, this just exercises
 // POST /api/invoices so the flow is checkable end to end from this page.
 //
-// Shows the created invoice from this call's own response rather than
-// relying on router.refresh() to re-fetch it: in mock mode, this route
-// handler and the page's Server Component are separate module graphs in
-// dev (confirmed — a repeat click here correctly gets 409 already-invoiced,
-// proving this route keeps its own state, while the page's own read never
-// sees it). That gap disappears once DATABASE_URL is set, since both sides
-// then query the same real row — router.refresh() is kept below for that case.
-export function CheckoutButton({ appointmentId }: { appointmentId: string }) {
+// Once created, renders InvoiceLineEditor (4.4) directly from this call's
+// own response rather than relying on router.refresh() to re-fetch it: in
+// mock mode, this route handler and the page's Server Component are
+// separate module graphs in dev (confirmed in livrable 2 — a repeat click
+// here correctly gets 409 already-invoiced, proving this route keeps its
+// own state, while the page's own read never sees it). That gap disappears
+// once DATABASE_URL is set, since both sides then query the same real row —
+// router.refresh() is kept below for that case.
+export function CheckoutButton({
+  appointmentId,
+  catalogItems,
+}: {
+  appointmentId: string;
+  catalogItems: CatalogItem[];
+}) {
   const router = useRouter();
   const [state, setState] = useState<
     | { status: "idle" }
     | { status: "loading" }
-    | { status: "done"; invoice: CreatedInvoice }
+    | { status: "done"; invoice: InvoiceWithDetails }
     | { status: "error"; message: string }
   >({ status: "idle" });
 
@@ -50,11 +54,7 @@ export function CheckoutButton({ appointmentId }: { appointmentId: string }) {
   }
 
   if (state.status === "done") {
-    return (
-      <span style={{ color: "#1a4" }}>
-        {state.invoice.invoiceNumber} créée ({formatCents(state.invoice.totalCents)})
-      </span>
-    );
+    return <InvoiceLineEditor initialInvoice={state.invoice} catalogItems={catalogItems} />;
   }
 
   return (

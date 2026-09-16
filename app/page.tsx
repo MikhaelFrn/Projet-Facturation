@@ -1,11 +1,16 @@
 import { isDatabaseConfigured } from "@/db/client";
 import { listAppointments } from "@/features/appointments/repository";
+import { searchCatalogItems } from "@/features/catalog/repository";
 import { listInvoices } from "@/features/invoicing/repository";
 import { formatCents } from "@/utils/currency";
 import { CheckoutButton } from "@/components/CheckoutButton";
 
 export default async function Home() {
-  const [invoices, appointments] = await Promise.all([listInvoices(), listAppointments()]);
+  const [invoices, appointments, catalogItems] = await Promise.all([
+    listInvoices(),
+    listAppointments(),
+    searchCatalogItems(""),
+  ]);
   const invoicedAppointmentIds = new Set(invoices.map((invoice) => invoice.appointmentId));
 
   return (
@@ -18,10 +23,10 @@ export default async function Home() {
 
       {!isDatabaseConfigured && (
         <p style={{ fontSize: "0.8rem", color: "#666" }}>
-          Note : en mode mock, cette page et la route /api/invoices ont chacune leur propre copie des
-          données en mémoire (particularité de Next.js en dev). Le bouton affiche donc le résultat de
-          son propre appel plutôt que de dépendre du rafraîchissement de la liste ci-dessous — ce
-          problème disparaît une fois DATABASE_URL configuré.
+          Note : en mode mock, cette page et les routes /api/invoices/* ont chacune leur propre copie
+          des données en mémoire (particularité de Next.js en dev). Le bouton et l&apos;éditeur de lignes
+          affichent donc le résultat de leur propre appel plutôt que de dépendre du rafraîchissement de
+          la liste ci-dessous — ce problème disparaît une fois DATABASE_URL configuré.
         </p>
       )}
 
@@ -47,7 +52,7 @@ export default async function Home() {
                   {alreadyInvoiced ? (
                     "Déjà facturé"
                   ) : appointment.status === "completed" ? (
-                    <CheckoutButton appointmentId={appointment.id} />
+                    <CheckoutButton appointmentId={appointment.id} catalogItems={catalogItems} />
                   ) : (
                     "—"
                   )}
