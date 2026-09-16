@@ -4,15 +4,32 @@ import { getDb, isDatabaseConfigured } from "@/db/client";
 import { invoiceItems, invoiceItemTaxes, invoices, taxes as taxesTable } from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
+import { getCatalogItem } from "@/features/catalog/repository";
+import type { CatalogItem } from "@/features/catalog/types";
 import {
   AppointmentAlreadyInvoicedError,
   AppointmentNotCompletedError,
   AppointmentNotFoundError,
+  CatalogItemNotFoundError,
+  InvoiceNotEditableError,
+  InvoiceNotFoundError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
 import { getMockInvoiceById, mockInvoices, mockTaxes } from "./mock-data";
-import { calculateLineTaxes, selectApplicableTaxes } from "./tax-calculation";
-import type { InvoiceWithDetails, Tax } from "./types";
+import { calculateLineTaxes, computeLineGrossAmountCents, selectApplicableTaxes } from "./tax-calculation";
+import type { InvoiceItem, InvoiceItemTax, InvoiceStatus, InvoiceWithDetails, Tax } from "./types";
+
+// 7.1: a closed invoice can never be modified directly. Extended past the
+// doc's literal "paid" example to partially_paid too — editing a line after
+// any payment exists would silently invalidate the "solde restant" math
+// against that payment.
+const EDITABLE_INVOICE_STATUSES: InvoiceStatus[] = ["draft", "unpaid"];
+
+function assertInvoiceEditable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!EDITABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotEditableError(invoice.id, invoice.status);
+  }
+}
 
 // Stand-in for a business/location settings table, which doesn't exist yet.
 // Every tax profile in our data (and every worked example in the requis doc)
@@ -265,4 +282,208 @@ function isUniqueViolation(error: unknown, constraintName: string): boolean {
     "constraint_name" in error &&
     error.constraint_name === constraintName
   );
+}
+
+// Unwraps the `tx` parameter type from db.transaction's callback, so the
+// recompute helper below can be typed without importing drizzle's internal
+// transaction type by name.
+type InvoicingTx = Parameters<ReturnType<typeof getDb>["transaction"]>[0] extends (
+  tx: infer T,
+  ...args: never[]
+) => unknown
+  ? T
+  : never;
+
+// Shared by addInvoiceItem/updateInvoiceItem/removeInvoiceItem (4.4): always
+// re-sums straight from invoice_items rather than adjusting the invoice's
+// existing totals incrementally, so a drift never compounds.
+async function recalculateInvoiceTotalsReal(tx: InvoicingTx, invoiceId: string): Promise<void> {
+  const items = await tx
+    .select({ subtotalCents: invoiceItems.subtotalCents, taxAmountCents: invoiceItems.taxAmountCents })
+    .from(invoiceItems)
+    .where(eq(invoiceItems.invoiceId, invoiceId));
+
+  const subtotalCents = items.reduce((sum, item) => sum + item.subtotalCents, 0);
+  const taxTotalCents = items.reduce((sum, item) => sum + item.taxAmountCents, 0);
+
+  const [invoiceRow] = await tx
+    .select({ tipCents: invoices.tipCents })
+    .from(invoices)
+    .where(eq(invoices.id, invoiceId));
+
+  await tx
+    .update(invoices)
+    .set({
+      subtotalCents,
+      taxTotalCents,
+      totalCents: subtotalCents + taxTotalCents + (invoiceRow?.tipCents ?? 0),
+      updatedAt: new Date(),
+    })
+    .where(eq(invoices.id, invoiceId));
+}
+
+function recalculateMockInvoiceTotals(invoice: InvoiceWithDetails): void {
+  invoice.subtotalCents = invoice.items.reduce((sum, item) => sum + item.subtotalCents, 0);
+  invoice.taxTotalCents = invoice.items.reduce((sum, item) => sum + item.taxAmountCents, 0);
+  invoice.totalCents = invoice.subtotalCents + invoice.taxTotalCents + invoice.tipCents;
+  invoice.updatedAt = new Date();
+}
+
+export interface AddInvoiceItemInput {
+  catalogItemId: string;
+  quantity: number;
+  employeeId?: string | null;
+  employeeName?: string | null;
+}
+
+// 4.4: search-and-add a product/service to an existing (open) invoice.
+export async function addInvoiceItem(
+  invoiceId: string,
+  input: AddInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const catalogItem = await getCatalogItem(input.catalogItemId);
+  if (!catalogItem || !catalogItem.active) {
+    throw new CatalogItemNotFoundError(input.catalogItemId);
+  }
+
+  if (!isDatabaseConfigured) {
+    return addInvoiceItemMock(invoice, catalogItem, input);
+  }
+  return addInvoiceItemReal(invoiceId, catalogItem, input);
+}
+
+function priceNewLine(catalogItem: CatalogItem, quantity: number) {
+  const applicableTaxes = selectApplicableTaxes(mockTaxes, {
+    itemType: catalogItem.itemType,
+    ...DEFAULT_TAX_JURISDICTION,
+    taxExempt: catalogItem.taxExempt,
+  });
+  const grossAmountCents = computeLineGrossAmountCents({
+    quantity,
+    unitPriceCents: catalogItem.unitPriceCents,
+    discountType: "none",
+    discountAmountCents: 0,
+    discountPercentMicros: 0,
+  });
+  return calculateLineTaxes(grossAmountCents, applicableTaxes);
+}
+
+function addInvoiceItemMock(
+  invoice: InvoiceWithDetails,
+  catalogItem: CatalogItem,
+  input: AddInvoiceItemInput
+): InvoiceWithDetails {
+  const taxCalc = priceNewLine(catalogItem, input.quantity);
+  const nextLineNumber = Math.max(0, ...invoice.items.map((item) => item.lineNumber)) + 1;
+  const itemId = randomUUID();
+  const now = new Date();
+
+  const newItem: InvoiceItem & { taxes: InvoiceItemTax[] } = {
+    id: itemId,
+    invoiceId: invoice.id,
+    lineNumber: nextLineNumber,
+    itemType: catalogItem.itemType,
+    catalogItemId: catalogItem.id,
+    description: catalogItem.name,
+    employeeId: input.employeeId ?? null,
+    employeeName: input.employeeName ?? null,
+    quantity: input.quantity,
+    unitPriceCents: catalogItem.unitPriceCents,
+    discountType: "none",
+    discountAmountCents: 0,
+    discountPercentMicros: 0,
+    packageRedemptionId: null,
+    tipCents: 0,
+    subtotalCents: taxCalc.subtotalCents,
+    taxAmountCents: taxCalc.taxAmountCents,
+    createdAt: now,
+    taxes: taxCalc.taxes.map((tax) => ({
+      id: randomUUID(),
+      invoiceItemId: itemId,
+      taxId: tax.taxId,
+      taxName: tax.taxName,
+      taxRateMicros: tax.taxRateMicros,
+      calculationOrder: tax.calculationOrder,
+      taxAmountCents: tax.taxAmountCents,
+    })),
+  };
+
+  invoice.items.push(newItem);
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function addInvoiceItemReal(
+  invoiceId: string,
+  catalogItem: CatalogItem,
+  input: AddInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  const taxProfiles = await db.select().from(taxesTable);
+  const applicableTaxes = selectApplicableTaxes(taxProfiles, {
+    itemType: catalogItem.itemType,
+    ...DEFAULT_TAX_JURISDICTION,
+    taxExempt: catalogItem.taxExempt,
+  });
+  const grossAmountCents = computeLineGrossAmountCents({
+    quantity: input.quantity,
+    unitPriceCents: catalogItem.unitPriceCents,
+    discountType: "none",
+    discountAmountCents: 0,
+    discountPercentMicros: 0,
+  });
+  const taxCalc = calculateLineTaxes(grossAmountCents, applicableTaxes);
+
+  await db.transaction(async (tx) => {
+    const existingItems = await tx
+      .select({ lineNumber: invoiceItems.lineNumber })
+      .from(invoiceItems)
+      .where(eq(invoiceItems.invoiceId, invoiceId));
+    const nextLineNumber = Math.max(0, ...existingItems.map((item) => item.lineNumber)) + 1;
+
+    const [insertedItem] = await tx
+      .insert(invoiceItems)
+      .values({
+        invoiceId,
+        lineNumber: nextLineNumber,
+        itemType: catalogItem.itemType,
+        catalogItemId: catalogItem.id,
+        description: catalogItem.name,
+        employeeId: input.employeeId ?? null,
+        employeeName: input.employeeName ?? null,
+        quantity: input.quantity,
+        unitPriceCents: catalogItem.unitPriceCents,
+        subtotalCents: taxCalc.subtotalCents,
+        taxAmountCents: taxCalc.taxAmountCents,
+      })
+      .returning({ id: invoiceItems.id });
+
+    if (taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        taxCalc.taxes.map((tax) => ({
+          invoiceItemId: insertedItem.id,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after adding a line`);
+  }
+  return updated;
 }
