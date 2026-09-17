@@ -3,6 +3,7 @@ import { listAppointments } from "@/features/appointments/repository";
 import { searchCatalogItems } from "@/features/catalog/repository";
 import { listInvoices } from "@/features/invoicing/repository";
 import { formatCents } from "@/utils/currency";
+import { appointmentStatusLabelFr, invoiceStatusLabelFr, paymentMethodLabelFr } from "@/utils/labels";
 import { CheckoutButton } from "@/components/CheckoutButton";
 
 export default async function Home() {
@@ -47,7 +48,7 @@ export default async function Home() {
               <tr key={appointment.id}>
                 <td>{appointment.customerName}</td>
                 <td>{appointment.services.map((s) => s.description).join(", ")}</td>
-                <td>{appointment.status}</td>
+                <td>{appointmentStatusLabelFr(appointment.status)}</td>
                 <td>
                   {alreadyInvoiced ? (
                     "Déjà facturé"
@@ -67,7 +68,7 @@ export default async function Home() {
       {invoices.map((invoice) => (
         <section key={invoice.id} style={{ marginTop: "1rem" }}>
           <h2>
-            {invoice.invoiceNumber} — {invoice.customerName} ({invoice.status})
+            {invoice.invoiceNumber} — {invoice.customerName} ({invoiceStatusLabelFr(invoice.status)})
           </h2>
 
           <table>
@@ -102,7 +103,9 @@ export default async function Home() {
           <p>
             Paiement(s) :{" "}
             {invoice.payments.length > 0
-              ? invoice.payments.map((p) => `${p.method} (${formatCents(p.amountCents)})`).join(" + ")
+              ? invoice.payments
+                  .map((p) => `${paymentMethodLabelFr(p.method)} (${formatCents(p.amountCents)})`)
+                  .join(" + ")
               : "aucun"}
           </p>
         </section>
