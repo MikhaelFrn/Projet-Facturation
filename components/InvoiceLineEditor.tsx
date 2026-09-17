@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { CatalogItem } from "@/features/catalog/types";
 import type { InvoiceWithDetails } from "@/features/invoicing/types";
 import { formatCents } from "@/utils/currency";
+import { invoiceStatusLabelFr } from "@/utils/labels";
 
 // Dev-harness only (4.4: add/modify/remove an invoice line). Keeps the
 // invoice entirely in local state, updated from each call's own response —
@@ -18,6 +19,11 @@ export function InvoiceLineEditor({
   catalogItems: CatalogItem[];
 }) {
   const [invoice, setInvoice] = useState(initialInvoice);
+  // Pending (not-yet-saved) quantity text per line, keyed by item id — a
+  // plain onBlur/onChange save was unreliable: the number input's own
+  // up/down spinner arrows change the value without moving focus out of the
+  // field, so onBlur never fired. An explicit button removes the ambiguity.
+  const [pendingQuantities, setPendingQuantities] = useState<Record<string, string>>({});
   const [selectedCatalogItemId, setSelectedCatalogItemId] = useState(catalogItems[0]?.id ?? "");
   const [quantity, setQuantity] = useState(1);
   const [busy, setBusy] = useState(false);
@@ -47,11 +53,21 @@ export function InvoiceLineEditor({
     });
   }
 
-  function handleUpdateQuantity(itemId: string, nextQuantity: number) {
-    call(`/api/invoices/${invoice.id}/items/${itemId}`, {
+  async function handleUpdateQuantity(itemId: string) {
+    const nextQuantity = Number(pendingQuantities[itemId]);
+    if (!Number.isInteger(nextQuantity) || nextQuantity <= 0) {
+      setError("La quantité doit être un entier positif");
+      return;
+    }
+    await call(`/api/invoices/${invoice.id}/items/${itemId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ quantity: nextQuantity }),
+    });
+    setPendingQuantities((prev) => {
+      const next = { ...prev };
+      delete next[itemId];
+      return next;
     });
   }
 
@@ -62,7 +78,7 @@ export function InvoiceLineEditor({
   return (
     <div style={{ border: "1px solid #ccc", borderRadius: 6, padding: "0.75rem", marginTop: "0.5rem" }}>
       <strong>
-        {invoice.invoiceNumber} ({invoice.status})
+        {invoice.invoiceNumber} ({invoiceStatusLabelFr(invoice.status)})
       </strong>
       <table>
         <thead>
@@ -75,31 +91,39 @@ export function InvoiceLineEditor({
           </tr>
         </thead>
         <tbody>
-          {invoice.items.map((item) => (
-            <tr key={item.id}>
-              <td>{item.description}</td>
-              <td>
-                <input
-                  type="number"
-                  min={1}
-                  defaultValue={item.quantity}
-                  disabled={busy}
-                  style={{ width: 50 }}
-                  onBlur={(e) => {
-                    const next = Number(e.target.value);
-                    if (next > 0 && next !== item.quantity) handleUpdateQuantity(item.id, next);
-                  }}
-                />
-              </td>
-              <td>{formatCents(item.subtotalCents)}</td>
-              <td>{formatCents(item.taxAmountCents)}</td>
-              <td>
-                <button disabled={busy} onClick={() => handleRemove(item.id)}>
-                  Supprimer
-                </button>
-              </td>
-            </tr>
-          ))}
+          {invoice.items.map((item) => {
+            const pendingValue = pendingQuantities[item.id] ?? String(item.quantity);
+            const hasPendingChange = pendingValue !== String(item.quantity);
+            return (
+              <tr key={item.id}>
+                <td>{item.description}</td>
+                <td>
+                  <input
+                    type="number"
+                    min={1}
+                    value={pendingValue}
+                    disabled={busy}
+                    style={{ width: 50 }}
+                    onChange={(e) =>
+                      setPendingQuantities((prev) => ({ ...prev, [item.id]: e.target.value }))
+                    }
+                  />
+                  {hasPendingChange && (
+                    <button disabled={busy} onClick={() => handleUpdateQuantity(item.id)}>
+                      Mettre à jour
+                    </button>
+                  )}
+                </td>
+                <td>{formatCents(item.subtotalCents)}</td>
+                <td>{formatCents(item.taxAmountCents)}</td>
+                <td>
+                  <button disabled={busy} onClick={() => handleRemove(item.id)}>
+                    Supprimer
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
 
