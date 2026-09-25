@@ -6,6 +6,7 @@ import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
 import { getCatalogItem } from "@/features/catalog/repository";
 import type { CatalogItem } from "@/features/catalog/types";
+import { DEFAULT_TAX_JURISDICTION } from "@/features/taxes/calculate";
 import { listTaxes } from "@/features/taxes/repository";
 import {
   AppointmentAlreadyInvoicedError,
@@ -38,11 +39,6 @@ function assertInvoiceEditable(invoice: { id: string; status: InvoiceStatus }): 
     throw new InvoiceNotEditableError(invoice.id, invoice.status);
   }
 }
-
-// Stand-in for a business/location settings table, which doesn't exist yet.
-// Every tax profile in our data (and every worked example in the requis doc)
-// is Québec, so this is the only jurisdiction checkout prices against for now.
-const DEFAULT_TAX_JURISDICTION = { country: "CA", region: "QC" } as const;
 
 // Single switch point: every screen calls these two functions instead of
 // touching mock-data.ts or the Drizzle client directly. Once DATABASE_URL is
