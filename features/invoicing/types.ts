@@ -1,7 +1,7 @@
 // Row types are inferred straight from db/schema.ts (the Drizzle schema),
 // so there is exactly one place — the schema — that defines shape. Editing
 // a column there flows through here automatically.
-import type { invoiceItems, invoiceItemTaxes, invoices, payments, taxes } from "@/db/schema";
+import type { invoiceItems, invoiceItemTaxes, invoices, payments } from "@/db/schema";
 
 export type {
   DiscountType,
@@ -12,7 +12,10 @@ export type {
   TaxAppliesTo,
 } from "@/db/schema";
 
-export type Tax = typeof taxes.$inferSelect;
+// Canonical definition now lives in features/taxes/types.ts (livrable 4 gave
+// taxes their own feature folder, mirroring catalog).
+export type { Tax } from "@/features/taxes/types";
+
 export type Invoice = typeof invoices.$inferSelect;
 export type InvoiceItem = typeof invoiceItems.$inferSelect;
 export type InvoiceItemTax = typeof invoiceItemTaxes.$inferSelect;

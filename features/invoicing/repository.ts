@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
-import { invoiceItems, invoiceItemTaxes, invoices, taxes as taxesTable } from "@/db/schema";
+import { invoiceItems, invoiceItemTaxes, invoices } from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
 import { getCatalogItem } from "@/features/catalog/repository";
 import type { CatalogItem } from "@/features/catalog/types";
+import { listTaxes } from "@/features/taxes/repository";
 import {
   AppointmentAlreadyInvoicedError,
   AppointmentNotCompletedError,
@@ -16,7 +17,7 @@ import {
   InvoiceNotFoundError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
-import { getMockInvoiceById, mockInvoices, mockTaxes } from "./mock-data";
+import { getMockInvoiceById, mockInvoices } from "./mock-data";
 import {
   calculateLineTaxes,
   computeLineGrossAmountCents,
@@ -115,7 +116,8 @@ function priceAppointmentServices(appointment: Appointment, taxProfiles: Tax[]) 
 }
 
 async function createInvoiceFromAppointmentMock(appointment: Appointment): Promise<InvoiceWithDetails> {
-  const priced = priceAppointmentServices(appointment, mockTaxes);
+  const taxProfiles = await listTaxes();
+  const priced = priceAppointmentServices(appointment, taxProfiles);
   const invoiceNumber = await generateInvoiceNumber();
   const invoiceId = randomUUID();
   const now = new Date();
@@ -192,7 +194,7 @@ async function createInvoiceFromAppointmentReal(appointment: Appointment): Promi
     throw new AppointmentAlreadyInvoicedError(appointment.id, existing.id);
   }
 
-  const taxProfiles = await db.select().from(taxesTable);
+  const taxProfiles = await listTaxes();
   const priced = priceAppointmentServices(appointment, taxProfiles);
   const invoiceNumber = await generateInvoiceNumber();
 
@@ -367,8 +369,8 @@ export async function addInvoiceItem(
   return addInvoiceItemReal(invoiceId, catalogItem, input);
 }
 
-function priceNewLine(catalogItem: CatalogItem, quantity: number) {
-  const applicableTaxes = selectApplicableTaxes(mockTaxes, {
+function priceNewLine(catalogItem: CatalogItem, quantity: number, taxProfiles: Tax[]) {
+  const applicableTaxes = selectApplicableTaxes(taxProfiles, {
     itemType: catalogItem.itemType,
     ...DEFAULT_TAX_JURISDICTION,
     taxExempt: catalogItem.taxExempt,
@@ -383,12 +385,13 @@ function priceNewLine(catalogItem: CatalogItem, quantity: number) {
   return calculateLineTaxes(grossAmountCents, applicableTaxes);
 }
 
-function addInvoiceItemMock(
+async function addInvoiceItemMock(
   invoice: InvoiceWithDetails,
   catalogItem: CatalogItem,
   input: AddInvoiceItemInput
-): InvoiceWithDetails {
-  const taxCalc = priceNewLine(catalogItem, input.quantity);
+): Promise<InvoiceWithDetails> {
+  const taxProfiles = await listTaxes();
+  const taxCalc = priceNewLine(catalogItem, input.quantity, taxProfiles);
   const nextLineNumber = Math.max(0, ...invoice.items.map((item) => item.lineNumber)) + 1;
   const itemId = randomUUID();
   const now = new Date();
@@ -436,20 +439,8 @@ async function addInvoiceItemReal(
 ): Promise<InvoiceWithDetails> {
   const db = getDb();
 
-  const taxProfiles = await db.select().from(taxesTable);
-  const applicableTaxes = selectApplicableTaxes(taxProfiles, {
-    itemType: catalogItem.itemType,
-    ...DEFAULT_TAX_JURISDICTION,
-    taxExempt: catalogItem.taxExempt,
-  });
-  const grossAmountCents = computeLineGrossAmountCents({
-    quantity: input.quantity,
-    unitPriceCents: catalogItem.unitPriceCents,
-    discountType: "none",
-    discountAmountCents: 0,
-    discountPercentMicros: 0,
-  });
-  const taxCalc = calculateLineTaxes(grossAmountCents, applicableTaxes);
+  const taxProfiles = await listTaxes();
+  const taxCalc = priceNewLine(catalogItem, input.quantity, taxProfiles);
 
   await db.transaction(async (tx) => {
     const existingItems = await tx
