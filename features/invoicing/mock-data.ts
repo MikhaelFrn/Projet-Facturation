@@ -1,37 +1,9 @@
-import type { InvoiceWithDetails, Tax } from "./types";
+import type { InvoiceWithDetails } from "./types";
 
 // Numbers below are taken straight from the requis doc's worked examples
 // (section 4.5 "Exemple de calcul (Québec)" and section 4.8 "Paiement
 // fractionné") so the totals here can be checked by hand against the doc.
-
-export const mockTaxes: Tax[] = [
-  {
-    id: "tax-tps",
-    name: "TPS",
-    rateMicros: 50_000, // 5.000%
-    country: "CA",
-    region: null,
-    appliesTo: "both",
-    includedInPrice: false,
-    calculationOrder: 1,
-    active: true,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-    updatedAt: new Date("2026-01-01T00:00:00Z"),
-  },
-  {
-    id: "tax-tvq",
-    name: "TVQ",
-    rateMicros: 99_750, // 9.975%, computed on the pre-TPS subtotal
-    country: "CA",
-    region: "QC",
-    appliesTo: "both",
-    includedInPrice: false,
-    calculationOrder: 2,
-    active: true,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-    updatedAt: new Date("2026-01-01T00:00:00Z"),
-  },
-];
+// Tax profiles themselves now live in features/taxes/mock-data.ts.
 
 const now = new Date("2026-08-05T14:30:00Z");
 
