@@ -2,15 +2,18 @@ import { isDatabaseConfigured } from "@/db/client";
 import { listAppointments } from "@/features/appointments/repository";
 import { searchCatalogItems } from "@/features/catalog/repository";
 import { listInvoices } from "@/features/invoicing/repository";
+import { listTaxes } from "@/features/taxes/repository";
 import { formatCents } from "@/utils/currency";
 import { appointmentStatusLabelFr, invoiceStatusLabelFr, paymentMethodLabelFr } from "@/utils/labels";
 import { CheckoutButton } from "@/components/CheckoutButton";
+import { TaxSettingsPanel } from "@/components/TaxSettingsPanel";
 
 export default async function Home() {
-  const [invoices, appointments, catalogItems] = await Promise.all([
+  const [invoices, appointments, catalogItems, taxes] = await Promise.all([
     listInvoices(),
     listAppointments(),
     searchCatalogItems(""),
+    listTaxes(),
   ]);
   const invoicedAppointmentIds = new Set(invoices.map((invoice) => invoice.appointmentId));
 
@@ -110,6 +113,9 @@ export default async function Home() {
           </p>
         </section>
       ))}
+
+      <h1 style={{ fontSize: "1.2rem", marginTop: "2rem" }}>Paramètres des taxes</h1>
+      <TaxSettingsPanel initialTaxes={taxes} />
     </main>
   );
 }
