@@ -3,6 +3,7 @@
 import { useState } from "react";
 import type { CatalogItem } from "@/features/catalog/types";
 import type { InvoiceWithDetails, PaymentMethod } from "@/features/invoicing/types";
+import type { TipBase, TipDistribution, TipMode } from "@/features/invoicing/tip-calculation";
 import { formatCents } from "@/utils/currency";
 import { invoiceStatusLabelFr, paymentMethodLabelFr } from "@/utils/labels";
 
@@ -17,6 +18,9 @@ const PAYMENT_METHODS: PaymentMethod[] = [
   "store_credit",
 ];
 const TENDERABLE_METHODS: PaymentMethod[] = ["cash", "interac"];
+const TIP_MODES: TipMode[] = ["fixed", "percent"];
+const TIP_BASES: TipBase[] = ["pre_tax", "post_tax"];
+const TIP_DISTRIBUTIONS: TipDistribution[] = ["proportional", "equal", "manual"];
 
 // Dev-harness only (4.4: add/modify/remove an invoice line). Keeps the
 // invoice entirely in local state, updated from each call's own response —
@@ -41,6 +45,12 @@ export function InvoiceLineEditor({
   const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
   const [paymentAmount, setPaymentAmount] = useState("");
   const [paymentTendered, setPaymentTendered] = useState("");
+  const [tipMode, setTipMode] = useState<TipMode>("fixed");
+  const [tipAmount, setTipAmount] = useState("");
+  const [tipPercent, setTipPercent] = useState("");
+  const [tipBase, setTipBase] = useState<TipBase>("pre_tax");
+  const [tipDistribution, setTipDistribution] = useState<TipDistribution>("proportional");
+  const [manualTipAmounts, setManualTipAmounts] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -109,6 +119,51 @@ export function InvoiceLineEditor({
     setPaymentTendered("");
   }
 
+  async function handleSetTip() {
+    const body: Record<string, unknown> = { mode: tipMode, distribution: tipDistribution };
+
+    if (tipMode === "fixed") {
+      const amountCents = Math.round(Number(tipAmount) * 100);
+      if (!Number.isInteger(amountCents) || amountCents < 0) {
+        setError("Le montant du pourboire doit être un nombre positif ou zéro");
+        return;
+      }
+      body.amountCents = amountCents;
+    } else {
+      const percent = Number(tipPercent);
+      if (!Number.isFinite(percent) || percent < 0) {
+        setError("Le pourcentage doit être un nombre positif ou zéro");
+        return;
+      }
+      body.percent = percent;
+      body.base = tipBase;
+    }
+
+    if (tipDistribution === "manual") {
+      body.manualAmounts = tipEmployees.map((employee) => ({
+        employeeId: employee.id,
+        amountCents: Math.round(Number(manualTipAmounts[employee.id] ?? "0") * 100),
+      }));
+    }
+
+    await call(`/api/invoices/${invoice.id}/tip`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // Same eligibility rule as setInvoiceTip: service lines with an assigned
+  // employee only — used to render per-employee manual-amount inputs.
+  const tipEmployees = invoice.items
+    .filter((item) => item.itemType === "service" && item.employeeId)
+    .reduce<{ id: string; name: string }[]>((acc, item) => {
+      if (!acc.some((employee) => employee.id === item.employeeId)) {
+        acc.push({ id: item.employeeId as string, name: item.employeeName ?? (item.employeeId as string) });
+      }
+      return acc;
+    }, []);
+
   return (
     <div style={{ border: "1px solid #ccc", borderRadius: 6, padding: "0.75rem", marginTop: "0.5rem" }}>
       <strong>
@@ -121,6 +176,7 @@ export function InvoiceLineEditor({
             <th>Qté</th>
             <th>Sous-total</th>
             <th>Taxes</th>
+            <th>Pourboire</th>
             <th></th>
           </tr>
         </thead>
@@ -150,6 +206,7 @@ export function InvoiceLineEditor({
                 </td>
                 <td>{formatCents(item.subtotalCents)}</td>
                 <td>{formatCents(item.taxAmountCents)}</td>
+                <td>{formatCents(item.tipCents)}</td>
                 <td>
                   <button disabled={busy} onClick={() => handleRemove(item.id)}>
                     Supprimer
@@ -189,6 +246,86 @@ export function InvoiceLineEditor({
         <button onClick={handleAdd} disabled={busy || !selectedCatalogItemId}>
           Ajouter
         </button>
+      </div>
+
+      <div style={{ marginTop: "1rem" }}>
+        <strong>Pourboire</strong>
+        <div>
+          <select value={tipMode} onChange={(e) => setTipMode(e.target.value as TipMode)} disabled={busy}>
+            {TIP_MODES.map((mode) => (
+              <option key={mode} value={mode}>
+                {mode === "fixed" ? "Montant fixe" : "Pourcentage"}
+              </option>
+            ))}
+          </select>
+          {tipMode === "fixed" ? (
+            <input
+              placeholder="Montant $"
+              type="number"
+              step="0.01"
+              value={tipAmount}
+              onChange={(e) => setTipAmount(e.target.value)}
+              disabled={busy}
+              style={{ width: 90 }}
+            />
+          ) : (
+            <>
+              <input
+                placeholder="Pourcentage"
+                type="number"
+                step="0.1"
+                value={tipPercent}
+                onChange={(e) => setTipPercent(e.target.value)}
+                disabled={busy}
+                style={{ width: 80 }}
+              />
+              <select value={tipBase} onChange={(e) => setTipBase(e.target.value as TipBase)} disabled={busy}>
+                {TIP_BASES.map((base) => (
+                  <option key={base} value={base}>
+                    {base === "pre_tax" ? "Avant taxes" : "Après taxes"}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+          <select
+            value={tipDistribution}
+            onChange={(e) => setTipDistribution(e.target.value as TipDistribution)}
+            disabled={busy}
+          >
+            {TIP_DISTRIBUTIONS.map((mode) => (
+              <option key={mode} value={mode}>
+                {mode === "proportional" ? "Prorata" : mode === "equal" ? "Égale" : "Manuelle"}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={handleSetTip}
+            disabled={busy || (tipMode === "fixed" ? !tipAmount : !tipPercent)}
+          >
+            Appliquer le pourboire
+          </button>
+        </div>
+
+        {tipDistribution === "manual" && (
+          <div>
+            {tipEmployees.map((employee) => (
+              <label key={employee.id} style={{ marginRight: "0.5rem" }}>
+                {employee.name} :{" "}
+                <input
+                  type="number"
+                  step="0.01"
+                  value={manualTipAmounts[employee.id] ?? ""}
+                  onChange={(e) =>
+                    setManualTipAmounts((prev) => ({ ...prev, [employee.id]: e.target.value }))
+                  }
+                  disabled={busy}
+                  style={{ width: 80 }}
+                />
+              </label>
+            ))}
+          </div>
+        )}
       </div>
 
       {(() => {
