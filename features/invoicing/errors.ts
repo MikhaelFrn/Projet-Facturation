@@ -89,3 +89,22 @@ export class PaymentExceedsBalanceError extends Error {
     this.name = "PaymentExceedsBalanceError";
   }
 }
+
+// 4.6: "le pourboire est toujours attribué à une employée spécifique" — an
+// invoice with no service line carrying an employeeId has nowhere valid to
+// put a tip.
+export class NoTipEligibleLinesError extends Error {
+  constructor(public readonly invoiceId: string) {
+    super(`Invoice ${invoiceId} has no service line with an assigned employee to attribute a tip to`);
+    this.name = "NoTipEligibleLinesError";
+  }
+}
+
+// Thrown by tip-calculation.ts's prorateTip for a malformed 'manual'
+// distribution: wrong sum, or an amount for an employee not on the invoice.
+export class InvalidTipDistributionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidTipDistributionError";
+  }
+}
