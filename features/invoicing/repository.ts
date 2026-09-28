@@ -17,6 +17,7 @@ import {
   InvoiceNotEditableError,
   InvoiceNotFoundError,
   InvoiceNotPayableError,
+  NoTipEligibleLinesError,
   PaymentExceedsBalanceError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
@@ -28,6 +29,14 @@ import {
   taxRateInputsFromSnapshot,
   type LineTaxCalculation,
 } from "./tax-calculation";
+import {
+  computeTipTotalCents,
+  prorateTip,
+  type ManualTipAmount,
+  type TipBase,
+  type TipDistribution,
+  type TipMode,
+} from "./tip-calculation";
 import type {
   DiscountType,
   InvoiceItem,
@@ -801,6 +810,91 @@ async function recordPaymentReal(
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after recording a payment`);
+  }
+  return updated;
+}
+
+export interface SetInvoiceTipInput {
+  mode: TipMode;
+  amountCents?: number;
+  percent?: number;
+  base?: TipBase; // only meaningful when mode === 'percent'; defaults to pre_tax
+  distribution: TipDistribution;
+  manualAmounts?: ManualTipAmount[];
+}
+
+// 4.6: set (or replace) the invoice's tip and prorate it across eligible
+// lines. Same editability gate as line edits (draft/unpaid only) — changing
+// the tip after a payment exists has the same "invalidates solde restant"
+// problem. A one-shot calculation: adding a line after the tip is set does
+// NOT retroactively reprorate it — call this again if that's needed.
+export async function setInvoiceTip(
+  invoiceId: string,
+  input: SetInvoiceTipInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const eligibleLines = invoice.items
+    .filter((item): item is typeof item & { employeeId: string } => item.itemType === "service" && item.employeeId !== null)
+    .map((item) => ({ lineId: item.id, employeeId: item.employeeId, valueCents: item.subtotalCents }));
+
+  if (eligibleLines.length === 0) {
+    throw new NoTipEligibleLinesError(invoiceId);
+  }
+
+  const tipTotalCents = computeTipTotalCents({
+    mode: input.mode,
+    amountCents: input.amountCents,
+    percent: input.percent,
+    base: input.base ?? "pre_tax",
+    subtotalCents: invoice.subtotalCents,
+    taxTotalCents: invoice.taxTotalCents,
+  });
+
+  const lineTips = prorateTip(tipTotalCents, eligibleLines, input.distribution, input.manualAmounts);
+  const tipByLineId = new Map(lineTips.map((result) => [result.lineId, result.tipCents]));
+
+  if (!isDatabaseConfigured) {
+    return setInvoiceTipMock(invoice, tipTotalCents, tipByLineId);
+  }
+  return setInvoiceTipReal(invoiceId, tipTotalCents, tipByLineId);
+}
+
+function setInvoiceTipMock(
+  invoice: InvoiceWithDetails,
+  tipTotalCents: number,
+  tipByLineId: Map<string, number>
+): InvoiceWithDetails {
+  for (const item of invoice.items) {
+    item.tipCents = tipByLineId.get(item.id) ?? 0;
+  }
+  invoice.tipCents = tipTotalCents;
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function setInvoiceTipReal(
+  invoiceId: string,
+  tipTotalCents: number,
+  tipByLineId: Map<string, number>
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    for (const [lineId, tipCents] of tipByLineId) {
+      await tx.update(invoiceItems).set({ tipCents }).where(eq(invoiceItems.id, lineId));
+    }
+    await tx.update(invoices).set({ tipCents: tipTotalCents }).where(eq(invoices.id, invoiceId));
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after setting tip`);
   }
   return updated;
 }
