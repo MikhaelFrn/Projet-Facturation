@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
-import { invoiceItems, invoiceItemTaxes, invoices } from "@/db/schema";
+import { invoiceItems, invoiceItemTaxes, invoices, payments } from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
 import { getCatalogItem } from "@/features/catalog/repository";
@@ -16,6 +16,8 @@ import {
   InvoiceItemNotFoundError,
   InvoiceNotEditableError,
   InvoiceNotFoundError,
+  InvoiceNotPayableError,
+  PaymentExceedsBalanceError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
 import { getMockInvoiceById, mockInvoices } from "./mock-data";
@@ -26,7 +28,16 @@ import {
   taxRateInputsFromSnapshot,
   type LineTaxCalculation,
 } from "./tax-calculation";
-import type { DiscountType, InvoiceItem, InvoiceItemTax, InvoiceStatus, InvoiceWithDetails, Tax } from "./types";
+import type {
+  DiscountType,
+  InvoiceItem,
+  InvoiceItemTax,
+  InvoiceStatus,
+  InvoiceWithDetails,
+  Payment,
+  PaymentMethod,
+  Tax,
+} from "./types";
 
 // 7.1: a closed invoice can never be modified directly. Extended past the
 // doc's literal "paid" example to partially_paid too — editing a line after
@@ -37,6 +48,18 @@ const EDITABLE_INVOICE_STATUSES: InvoiceStatus[] = ["draft", "unpaid"];
 function assertInvoiceEditable(invoice: { id: string; status: InvoiceStatus }): void {
   if (!EDITABLE_INVOICE_STATUSES.includes(invoice.status)) {
     throw new InvoiceNotEditableError(invoice.id, invoice.status);
+  }
+}
+
+// 4.8: distinct from EDITABLE_INVOICE_STATUSES — a partially_paid invoice
+// can't have its lines touched anymore, but must still be able to take more
+// payments (that's the whole point of a split payment). draft is excluded:
+// nothing to collect on an invoice that hasn't been submitted yet.
+const PAYABLE_INVOICE_STATUSES: InvoiceStatus[] = ["unpaid", "partially_paid"];
+
+function assertInvoicePayable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!PAYABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotPayableError(invoice.id, invoice.status);
   }
 }
 
@@ -651,6 +674,133 @@ export async function removeInvoiceItem(invoiceId: string, itemId: string): Prom
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after removing a line`);
+  }
+  return updated;
+}
+
+export interface RecordPaymentInput {
+  method: PaymentMethod;
+  amountCents: number;
+  // cash/interac only — validated at the route layer, trusted here.
+  amountTenderedCents?: number | null;
+  reference?: string | null;
+}
+
+// 4.7/4.8: register one payment (of possibly several — split payment) on an
+// open invoice. Recomputes status from the actual sum of completed payments
+// rather than incrementing a counter, same "never trust a running total"
+// principle as recalculateInvoiceTotalsReal/Mock for line totals.
+export async function recordPayment(
+  invoiceId: string,
+  input: RecordPaymentInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = await getInvoice(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    return recordPaymentMock(invoice, input);
+  }
+
+  return recordPaymentReal(invoiceId, input);
+}
+
+function recordPaymentMock(invoice: InvoiceWithDetails, input: RecordPaymentInput): InvoiceWithDetails {
+  assertInvoicePayable(invoice);
+
+  const paidSoFar = invoice.payments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const remainingBalanceCents = invoice.totalCents - paidSoFar;
+
+  if (input.amountCents > remainingBalanceCents) {
+    throw new PaymentExceedsBalanceError(invoice.id, input.amountCents, remainingBalanceCents);
+  }
+
+  const now = new Date();
+  const changeGivenCents =
+    input.amountTenderedCents != null ? input.amountTenderedCents - input.amountCents : null;
+  const nextStatus: InvoiceStatus =
+    paidSoFar + input.amountCents >= invoice.totalCents ? "paid" : "partially_paid";
+
+  const payment: Payment = {
+    id: randomUUID(),
+    invoiceId: invoice.id,
+    method: input.method,
+    status: "completed",
+    amountCents: input.amountCents,
+    amountTenderedCents: input.amountTenderedCents ?? null,
+    changeGivenCents,
+    reference: input.reference ?? null,
+    createdAt: now,
+  };
+
+  invoice.payments.push(payment);
+  invoice.status = nextStatus;
+  if (nextStatus === "paid") {
+    invoice.paidAt = now;
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function recordPaymentReal(
+  invoiceId: string,
+  input: RecordPaymentInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+  const now = new Date();
+
+  await db.transaction(async (tx) => {
+    // Locks the invoice row for the rest of this transaction: a second
+    // concurrent payment on the same invoice blocks here until this one
+    // commits, so two payments can never both read the same "before"
+    // balance and together overshoot the invoice total.
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoicePayable(invoiceRow);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const paidSoFar = existingPayments
+      .filter((payment) => payment.status === "completed")
+      .reduce((sum, payment) => sum + payment.amountCents, 0);
+    const remainingBalanceCents = invoiceRow.totalCents - paidSoFar;
+
+    if (input.amountCents > remainingBalanceCents) {
+      throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+    }
+
+    const changeGivenCents =
+      input.amountTenderedCents != null ? input.amountTenderedCents - input.amountCents : null;
+    const nextStatus: InvoiceStatus =
+      paidSoFar + input.amountCents >= invoiceRow.totalCents ? "paid" : "partially_paid";
+
+    await tx.insert(payments).values({
+      invoiceId,
+      method: input.method,
+      status: "completed",
+      amountCents: input.amountCents,
+      amountTenderedCents: input.amountTenderedCents ?? null,
+      changeGivenCents,
+      reference: input.reference ?? null,
+    });
+
+    const updateFields: Partial<typeof invoices.$inferInsert> = { status: nextStatus, updatedAt: now };
+    if (nextStatus === "paid") {
+      updateFields.paidAt = now;
+    }
+    await tx.update(invoices).set(updateFields).where(eq(invoices.id, invoiceId));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after recording a payment`);
   }
   return updated;
 }
