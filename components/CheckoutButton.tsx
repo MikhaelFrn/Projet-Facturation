@@ -4,15 +4,15 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import type { CatalogItem } from "@/features/catalog/types";
 import type { InvoiceWithDetails } from "@/features/invoicing/types";
-import { InvoiceLineEditor } from "./InvoiceLineEditor";
+import { CheckoutScreen } from "./checkout/CheckoutScreen";
 
 // Stands in for the "Procéder au paiement" button the real calendar UI will
 // have (requis doc 4.1) — we don't own that UI, this just exercises
 // POST /api/invoices so the flow is checkable end to end from this page.
 //
-// Once created, renders InvoiceLineEditor (4.4) directly from this call's
-// own response rather than relying on router.refresh() to re-fetch it: in
-// mock mode, this route handler and the page's Server Component are
+// Once created, renders CheckoutScreen (livrable 7) directly from this
+// call's own response rather than relying on router.refresh() to re-fetch
+// it: in mock mode, this route handler and the page's Server Component are
 // separate module graphs in dev (confirmed in livrable 2 — a repeat click
 // here correctly gets 409 already-invoiced, proving this route keeps its
 // own state, while the page's own read never sees it). That gap disappears
@@ -54,7 +54,7 @@ export function CheckoutButton({
   }
 
   if (state.status === "done") {
-    return <InvoiceLineEditor initialInvoice={state.invoice} catalogItems={catalogItems} />;
+    return <CheckoutScreen initialInvoice={state.invoice} catalogItems={catalogItems} />;
   }
 
   return (

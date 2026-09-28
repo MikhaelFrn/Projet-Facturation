@@ -6,7 +6,7 @@ import type { Tax, TaxAppliesTo } from "@/features/taxes/types";
 const APPLIES_TO_OPTIONS: TaxAppliesTo[] = ["both", "services", "products"];
 
 // Dev-harness stand-in for livrable 10's real "Paramètres > Taxes" screen.
-// Same reasoning as InvoiceLineEditor: keeps its own state, updated from
+// Same reasoning as CheckoutScreen: keeps its own state, updated from
 // each call's own response rather than a page refresh (mock-mode module
 // isolation — see the note under the top banner).
 export function TaxSettingsPanel({ initialTaxes }: { initialTaxes: Tax[] }) {
