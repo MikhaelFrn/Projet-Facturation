@@ -2,9 +2,21 @@
 
 import { useState } from "react";
 import type { CatalogItem } from "@/features/catalog/types";
-import type { InvoiceWithDetails } from "@/features/invoicing/types";
+import type { InvoiceWithDetails, PaymentMethod } from "@/features/invoicing/types";
 import { formatCents } from "@/utils/currency";
-import { invoiceStatusLabelFr } from "@/utils/labels";
+import { invoiceStatusLabelFr, paymentMethodLabelFr } from "@/utils/labels";
+
+const PAYMENT_METHODS: PaymentMethod[] = [
+  "cash",
+  "credit_card",
+  "debit_card",
+  "interac",
+  "square",
+  "gift_card",
+  "package",
+  "store_credit",
+];
+const TENDERABLE_METHODS: PaymentMethod[] = ["cash", "interac"];
 
 // Dev-harness only (4.4: add/modify/remove an invoice line). Keeps the
 // invoice entirely in local state, updated from each call's own response —
@@ -26,6 +38,9 @@ export function InvoiceLineEditor({
   const [pendingQuantities, setPendingQuantities] = useState<Record<string, string>>({});
   const [selectedCatalogItemId, setSelectedCatalogItemId] = useState(catalogItems[0]?.id ?? "");
   const [quantity, setQuantity] = useState(1);
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>("cash");
+  const [paymentAmount, setPaymentAmount] = useState("");
+  const [paymentTendered, setPaymentTendered] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -73,6 +88,25 @@ export function InvoiceLineEditor({
 
   function handleRemove(itemId: string) {
     call(`/api/invoices/${invoice.id}/items/${itemId}`, { method: "DELETE" });
+  }
+
+  async function handleRecordPayment() {
+    const amountCents = Math.round(Number(paymentAmount) * 100);
+    if (!Number.isInteger(amountCents) || amountCents <= 0) {
+      setError("Le montant doit être un nombre positif");
+      return;
+    }
+    const isTenderable = TENDERABLE_METHODS.includes(paymentMethod);
+    const amountTenderedCents =
+      isTenderable && paymentTendered.trim() !== "" ? Math.round(Number(paymentTendered) * 100) : undefined;
+
+    await call(`/api/invoices/${invoice.id}/payments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method: paymentMethod, amountCents, amountTenderedCents }),
+    });
+    setPaymentAmount("");
+    setPaymentTendered("");
   }
 
   return (
@@ -156,6 +190,69 @@ export function InvoiceLineEditor({
           Ajouter
         </button>
       </div>
+
+      {(() => {
+        const paidSoFar = invoice.payments
+          .filter((p) => p.status === "completed")
+          .reduce((sum, p) => sum + p.amountCents, 0);
+        const remainingBalanceCents = invoice.totalCents - paidSoFar;
+
+        return (
+          <div style={{ marginTop: "1rem" }}>
+            <strong>Paiements</strong>
+            {invoice.payments.length > 0 && (
+              <ul>
+                {invoice.payments.map((payment) => (
+                  <li key={payment.id}>
+                    {paymentMethodLabelFr(payment.method)} : {formatCents(payment.amountCents)}
+                    {payment.changeGivenCents ? ` (monnaie rendue : ${formatCents(payment.changeGivenCents)})` : ""}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p>Solde restant : {formatCents(remainingBalanceCents)}</p>
+
+            {remainingBalanceCents > 0 && (
+              <div>
+                <select
+                  value={paymentMethod}
+                  onChange={(e) => setPaymentMethod(e.target.value as PaymentMethod)}
+                  disabled={busy}
+                >
+                  {PAYMENT_METHODS.map((method) => (
+                    <option key={method} value={method}>
+                      {paymentMethodLabelFr(method)}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  placeholder="Montant $"
+                  type="number"
+                  step="0.01"
+                  value={paymentAmount}
+                  onChange={(e) => setPaymentAmount(e.target.value)}
+                  disabled={busy}
+                  style={{ width: 90 }}
+                />
+                {TENDERABLE_METHODS.includes(paymentMethod) && (
+                  <input
+                    placeholder="Montant reçu $"
+                    type="number"
+                    step="0.01"
+                    value={paymentTendered}
+                    onChange={(e) => setPaymentTendered(e.target.value)}
+                    disabled={busy}
+                    style={{ width: 100 }}
+                  />
+                )}
+                <button onClick={handleRecordPayment} disabled={busy || !paymentAmount}>
+                  Enregistrer le paiement
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {error && <p style={{ color: "#c33" }}>{error}</p>}
     </div>
