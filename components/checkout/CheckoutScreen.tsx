@@ -5,7 +5,7 @@ import type { CatalogItem } from "@/features/catalog/types";
 import type { InvoiceWithDetails } from "@/features/invoicing/types";
 import { invoiceStatusLabelFr } from "@/utils/labels";
 import { LineItemsTable } from "./LineItemsTable";
-import { PaymentPanel, type PaymentSubmission } from "./PaymentPanel";
+import { PaymentPanel, type GiftCardRedemptionSubmission, type PaymentSubmission } from "./PaymentPanel";
 import { TipControl, type TipSubmission } from "./TipControl";
 import { TotalsSummary } from "./TotalsSummary";
 
@@ -81,6 +81,14 @@ export function CheckoutScreen({ initialInvoice, catalogItems }: CheckoutScreenP
     });
   }
 
+  function handleRedeemGiftCard(redemption: GiftCardRedemptionSubmission) {
+    call(`/api/invoices/${invoice.id}/gift-card-redemptions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(redemption),
+    });
+  }
+
   return (
     <div style={{ border: "1px solid #ccc", borderRadius: 6, padding: "0.75rem", marginTop: "0.5rem" }}>
       <p>
@@ -106,7 +114,12 @@ export function CheckoutScreen({ initialInvoice, catalogItems }: CheckoutScreenP
 
       <div style={{ marginTop: "1rem" }}>
         <strong>Paiement</strong>
-        <PaymentPanel invoice={invoice} busy={busy} onSubmit={handleRecordPayment} />
+        <PaymentPanel
+          invoice={invoice}
+          busy={busy}
+          onSubmit={handleRecordPayment}
+          onRedeemGiftCard={handleRedeemGiftCard}
+        />
       </div>
 
       {error && <p style={{ color: "#c33" }}>{error}</p>}

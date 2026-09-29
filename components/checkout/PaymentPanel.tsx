@@ -27,11 +27,23 @@ export interface PaymentSubmission {
   amountTenderedCents?: number;
 }
 
+export interface GiftCardRedemptionSubmission {
+  code: string;
+  amountCents: number;
+}
+
 interface PaymentPanelProps {
   invoice: InvoiceWithDetails;
   busy: boolean;
   onSubmit: (payment: PaymentSubmission) => void;
+  onRedeemGiftCard: (redemption: GiftCardRedemptionSubmission) => void;
 }
+
+type GiftCardLookup =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "found"; remainingBalanceCents: number }
+  | { status: "error"; message: string };
 
 // Doc §6 Écran 1 / §4.7-4.8: one button per method, plus "Fractionner". Our
 // backend already supports a split payment simply by calling recordPayment
@@ -39,11 +51,14 @@ interface PaymentPanelProps {
 // the amount field defaults to the full remaining balance (assume one
 // method covers it); on, it starts empty so a partial amount can be
 // entered, and the form stays available for the next method afterward.
-export function PaymentPanel({ invoice, busy, onSubmit }: PaymentPanelProps) {
+export function PaymentPanel({ invoice, busy, onSubmit, onRedeemGiftCard }: PaymentPanelProps) {
   const [selectedMethod, setSelectedMethod] = useState<PaymentMethod | null>(null);
   const [splitMode, setSplitMode] = useState(false);
   const [amount, setAmount] = useState("");
   const [tendered, setTendered] = useState("");
+  const [giftCardCode, setGiftCardCode] = useState("");
+  const [giftCardLookup, setGiftCardLookup] = useState<GiftCardLookup>({ status: "idle" });
+  const [giftCardAmount, setGiftCardAmount] = useState("");
 
   const paidSoFar = invoice.payments
     .filter((payment) => payment.status === "completed")
@@ -54,6 +69,35 @@ export function PaymentPanel({ invoice, busy, onSubmit }: PaymentPanelProps) {
     setSelectedMethod(method);
     setAmount(splitMode ? "" : (remainingBalanceCents / 100).toFixed(2));
     setTendered("");
+    setGiftCardCode("");
+    setGiftCardLookup({ status: "idle" });
+    setGiftCardAmount("");
+  }
+
+  async function checkGiftCardBalance() {
+    setGiftCardLookup({ status: "checking" });
+    try {
+      const response = await fetch(`/api/gift-cards/${encodeURIComponent(giftCardCode)}`);
+      const body = await response.json();
+      if (!response.ok) {
+        setGiftCardLookup({ status: "error", message: body.error });
+        return;
+      }
+      setGiftCardLookup({ status: "found", remainingBalanceCents: body.remainingBalanceCents });
+      const suggested = Math.min(body.remainingBalanceCents, remainingBalanceCents);
+      setGiftCardAmount((suggested / 100).toFixed(2));
+    } catch (error) {
+      setGiftCardLookup({ status: "error", message: String(error) });
+    }
+  }
+
+  function handleConfirmGiftCard() {
+    const amountCents = Math.round(Number(giftCardAmount) * 100);
+    onRedeemGiftCard({ code: giftCardCode, amountCents });
+    setSelectedMethod(null);
+    setGiftCardCode("");
+    setGiftCardLookup({ status: "idle" });
+    setGiftCardAmount("");
   }
 
   function toggleSplit() {
@@ -116,7 +160,7 @@ export function PaymentPanel({ invoice, busy, onSubmit }: PaymentPanelProps) {
         </button>
       </div>
 
-      {selectedMethod && (
+      {selectedMethod && selectedMethod !== "gift_card" && (
         <div>
           <input
             placeholder="Montant $"
@@ -141,6 +185,45 @@ export function PaymentPanel({ invoice, busy, onSubmit }: PaymentPanelProps) {
           <button onClick={handleConfirm} disabled={busy || !amount}>
             Confirmer
           </button>
+        </div>
+      )}
+
+      {selectedMethod === "gift_card" && (
+        <div>
+          {/* 4.9: code entered first, balance shown before an amount is committed */}
+          <input
+            placeholder="Code du certificat"
+            value={giftCardCode}
+            onChange={(e) => {
+              setGiftCardCode(e.target.value);
+              setGiftCardLookup({ status: "idle" });
+            }}
+            disabled={busy}
+          />
+          <button onClick={checkGiftCardBalance} disabled={busy || !giftCardCode}>
+            Vérifier
+          </button>
+
+          {giftCardLookup.status === "found" && (
+            <>
+              <span> Solde disponible : {formatCents(giftCardLookup.remainingBalanceCents)} </span>
+              <input
+                placeholder="Montant $"
+                type="number"
+                step="0.01"
+                value={giftCardAmount}
+                onChange={(e) => setGiftCardAmount(e.target.value)}
+                disabled={busy}
+                style={{ width: 90 }}
+              />
+              <button onClick={handleConfirmGiftCard} disabled={busy || !giftCardAmount}>
+                Confirmer
+              </button>
+            </>
+          )}
+          {giftCardLookup.status === "error" && (
+            <p style={{ color: "#c33" }}>{giftCardLookup.message}</p>
+          )}
         </div>
       )}
     </div>
