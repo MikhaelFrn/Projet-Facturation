@@ -1,10 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { CatalogItem } from "@/features/catalog/types";
 import type { InvoiceWithDetails } from "@/features/invoicing/types";
 import { invoiceStatusLabelFr } from "@/utils/labels";
-import { LineItemsTable } from "./LineItemsTable";
+import { LineItemsTable, type EligiblePackageLine } from "./LineItemsTable";
 import { PaymentPanel, type GiftCardRedemptionSubmission, type PaymentSubmission } from "./PaymentPanel";
 import { TipControl, type TipSubmission } from "./TipControl";
 import { TotalsSummary } from "./TotalsSummary";
@@ -28,6 +28,25 @@ export function CheckoutScreen({ initialInvoice, catalogItems }: CheckoutScreenP
   const [invoice, setInvoice] = useState(initialInvoice);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [eligiblePackages, setEligiblePackages] = useState<EligiblePackageLine[]>([]);
+
+  // 4.10: "le système détecte" — re-checked against the invoice's own
+  // eligible-packages endpoint after every change (add/remove/redeem all
+  // change which lines qualify), not derived client-side.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/invoices/${invoice.id}/eligible-packages`)
+      .then((response) => response.json())
+      .then((body) => {
+        if (!cancelled) setEligiblePackages(body.eligibleLines ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setEligiblePackages([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [invoice]);
 
   async function call(path: string, init: RequestInit) {
     setBusy(true);
@@ -89,6 +108,14 @@ export function CheckoutScreen({ initialInvoice, catalogItems }: CheckoutScreenP
     });
   }
 
+  function handleRedeemPackage(itemId: string, packageId: string) {
+    call(`/api/invoices/${invoice.id}/items/${itemId}/redeem-package`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ packageId }),
+    });
+  }
+
   return (
     <div style={{ border: "1px solid #ccc", borderRadius: 6, padding: "0.75rem", marginTop: "0.5rem" }}>
       <p>
@@ -100,9 +127,11 @@ export function CheckoutScreen({ initialInvoice, catalogItems }: CheckoutScreenP
         invoice={invoice}
         catalogItems={catalogItems}
         busy={busy}
+        eligiblePackages={eligiblePackages}
         onAdd={handleAdd}
         onUpdateQuantity={handleUpdateQuantity}
         onRemove={handleRemove}
+        onRedeemPackage={handleRedeemPackage}
       />
 
       <TotalsSummary invoice={invoice} />
