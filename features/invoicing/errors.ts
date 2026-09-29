@@ -108,3 +108,17 @@ export class InvalidTipDistributionError extends Error {
     this.name = "InvalidTipDistributionError";
   }
 }
+
+// 4.10: once a line is covered by a package, further quantity/discount
+// edits or removal are blocked rather than silently letting the package's
+// already-deducted quantity drift out of sync with the invoice. There's no
+// "undo redemption" flow — same "no refund/void yet" scoping as livrable 5.
+export class InvoiceItemAlreadyRedeemedError extends Error {
+  constructor(
+    public readonly invoiceId: string,
+    public readonly itemId: string
+  ) {
+    super(`Invoice item ${itemId} is already covered by a package and cannot be modified`);
+    this.name = "InvoiceItemAlreadyRedeemedError";
+  }
+}

@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
-import { giftCards as giftCardsTable, invoiceItems, invoiceItemTaxes, invoices, payments } from "@/db/schema";
+import {
+  giftCards as giftCardsTable,
+  invoiceItems,
+  invoiceItemTaxes,
+  invoices,
+  packageItems as packageItemsTable,
+  packages as packagesTable,
+  payments,
+} from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
 import { getCatalogItem } from "@/features/catalog/repository";
@@ -9,6 +17,14 @@ import type { CatalogItem } from "@/features/catalog/types";
 import { GiftCardNotFoundError } from "@/features/gift-cards/errors";
 import { getMockGiftCardByCode } from "@/features/gift-cards/mock-data";
 import { assertGiftCardRedeemable } from "@/features/gift-cards/repository";
+import {
+  PackageCustomerMismatchError,
+  PackageInsufficientQuantityError,
+  PackageItemNotFoundError,
+  PackageNotActiveError,
+  PackageNotFoundError,
+} from "@/features/packages/errors";
+import { getMockPackageById, getMockPackageItemsByPackageId } from "@/features/packages/mock-data";
 import { DEFAULT_TAX_JURISDICTION } from "@/features/taxes/calculate";
 import { listTaxes } from "@/features/taxes/repository";
 import {
@@ -16,6 +32,7 @@ import {
   AppointmentNotCompletedError,
   AppointmentNotFoundError,
   CatalogItemNotFoundError,
+  InvoiceItemAlreadyRedeemedError,
   InvoiceItemNotFoundError,
   InvoiceNotEditableError,
   InvoiceNotFoundError,
@@ -1048,6 +1065,237 @@ async function redeemGiftCardReal(
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after redeeming a gift card`);
+  }
+  return updated;
+}
+
+export interface RedeemPackageForLineInput {
+  packageId: string;
+}
+
+// 4.10: unlike a gift card, this isn't a payment — the line itself becomes
+// free. Reuses the exact discount mechanism updateInvoiceItem already has
+// (100%-of-value 'amount' discount) rather than inventing new pricing math,
+// so tax/subtotal recompute for free. Locks the invoice_items row, the
+// packages row, and the package_items row in one transaction (real branch)
+// — same reasoning as redeemGiftCard, extended to three resources instead
+// of two, since a package redemption touches the invoice's line AND the
+// package's own state.
+export async function redeemPackageForLine(
+  invoiceId: string,
+  itemId: string,
+  input: RedeemPackageForLineInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    return redeemPackageForLineMock(invoiceId, itemId, input.packageId);
+  }
+  return redeemPackageForLineReal(invoiceId, itemId, input.packageId);
+}
+
+function assertPackageActive(pkg: { id: string; status: string; expiresAt: Date | null }): void {
+  const isExpired = pkg.expiresAt !== null && pkg.expiresAt.getTime() < Date.now();
+  if (isExpired || pkg.status === "expired") {
+    throw new PackageNotActiveError(pkg.id, "expired");
+  }
+  if (pkg.status === "completed") {
+    throw new PackageNotActiveError(pkg.id, "completed");
+  }
+}
+
+function redeemPackageForLineMock(invoiceId: string, itemId: string, packageId: string): InvoiceWithDetails {
+  const invoice = getMockInvoiceById(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const item = invoice.items.find((line) => line.id === itemId);
+  if (!item) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+  if (item.packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+  }
+  if (!item.catalogItemId) {
+    throw new PackageItemNotFoundError(packageId, "unknown");
+  }
+
+  const pkg = getMockPackageById(packageId);
+  if (!pkg) {
+    throw new PackageNotFoundError(packageId);
+  }
+  if (pkg.customerId !== invoice.customerId) {
+    throw new PackageCustomerMismatchError(packageId, invoiceId);
+  }
+  assertPackageActive(pkg);
+
+  const packageItemsForPackage = getMockPackageItemsByPackageId(packageId);
+  const packageItem = packageItemsForPackage.find((pi) => pi.catalogItemId === item.catalogItemId);
+  if (!packageItem) {
+    throw new PackageItemNotFoundError(packageId, item.catalogItemId);
+  }
+  if (packageItem.remainingQuantity < item.quantity) {
+    throw new PackageInsufficientQuantityError(
+      packageId,
+      item.catalogItemId,
+      item.quantity,
+      packageItem.remainingQuantity
+    );
+  }
+
+  const rawCents = item.quantity * item.unitPriceCents;
+  const taxCalc = calculateLineTaxes(0, taxRateInputsFromSnapshot(item.taxes));
+
+  item.discountType = "amount";
+  item.discountAmountCents = rawCents;
+  item.discountPercentMicros = 0;
+  item.packageRedemptionId = packageItem.id;
+  item.subtotalCents = taxCalc.subtotalCents;
+  item.taxAmountCents = taxCalc.taxAmountCents;
+  item.taxes = taxCalc.taxes.map((tax) => ({
+    id: randomUUID(),
+    invoiceItemId: item.id,
+    taxId: tax.taxId,
+    taxName: tax.taxName,
+    taxRateMicros: tax.taxRateMicros,
+    taxIncludedInPrice: tax.taxIncludedInPrice,
+    calculationOrder: tax.calculationOrder,
+    taxAmountCents: tax.taxAmountCents,
+  }));
+
+  packageItem.remainingQuantity -= item.quantity;
+
+  const allDepleted = packageItemsForPackage.every((pi) => pi.remainingQuantity <= 0);
+  if (allDepleted) {
+    pkg.status = "completed";
+    pkg.updatedAt = new Date();
+  }
+
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function redeemPackageForLineReal(
+  invoiceId: string,
+  itemId: string,
+  packageId: string
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceEditable(invoiceRow);
+
+    const [itemRow] = await tx
+      .select()
+      .from(invoiceItems)
+      .where(and(eq(invoiceItems.id, itemId), eq(invoiceItems.invoiceId, invoiceId)))
+      .for("update");
+    if (!itemRow) {
+      throw new InvoiceItemNotFoundError(invoiceId, itemId);
+    }
+    if (itemRow.packageRedemptionId) {
+      throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+    }
+    if (!itemRow.catalogItemId) {
+      throw new PackageItemNotFoundError(packageId, "unknown");
+    }
+
+    const [packageRow] = await tx
+      .select()
+      .from(packagesTable)
+      .where(eq(packagesTable.id, packageId))
+      .for("update");
+    if (!packageRow) {
+      throw new PackageNotFoundError(packageId);
+    }
+    if (packageRow.customerId !== invoiceRow.customerId) {
+      throw new PackageCustomerMismatchError(packageId, invoiceId);
+    }
+    assertPackageActive(packageRow);
+
+    const [packageItemRow] = await tx
+      .select()
+      .from(packageItemsTable)
+      .where(
+        and(eq(packageItemsTable.packageId, packageId), eq(packageItemsTable.catalogItemId, itemRow.catalogItemId))
+      )
+      .for("update");
+    if (!packageItemRow) {
+      throw new PackageItemNotFoundError(packageId, itemRow.catalogItemId);
+    }
+    if (packageItemRow.remainingQuantity < itemRow.quantity) {
+      throw new PackageInsufficientQuantityError(
+        packageId,
+        itemRow.catalogItemId,
+        itemRow.quantity,
+        packageItemRow.remainingQuantity
+      );
+    }
+
+    const existingTaxes = await tx
+      .select()
+      .from(invoiceItemTaxes)
+      .where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+    const taxCalc = calculateLineTaxes(0, taxRateInputsFromSnapshot(existingTaxes));
+    const rawCents = itemRow.quantity * itemRow.unitPriceCents;
+
+    await tx
+      .update(invoiceItems)
+      .set({
+        discountType: "amount",
+        discountAmountCents: rawCents,
+        discountPercentMicros: 0,
+        packageRedemptionId: packageItemRow.id,
+        subtotalCents: taxCalc.subtotalCents,
+        taxAmountCents: taxCalc.taxAmountCents,
+      })
+      .where(eq(invoiceItems.id, itemId));
+
+    await tx.delete(invoiceItemTaxes).where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+    if (taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        taxCalc.taxes.map((tax) => ({
+          invoiceItemId: itemId,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+
+    const nextRemainingQuantity = packageItemRow.remainingQuantity - itemRow.quantity;
+    await tx
+      .update(packageItemsTable)
+      .set({ remainingQuantity: nextRemainingQuantity })
+      .where(eq(packageItemsTable.id, packageItemRow.id));
+
+    const siblingItems = await tx
+      .select({ id: packageItemsTable.id, remainingQuantity: packageItemsTable.remainingQuantity })
+      .from(packageItemsTable)
+      .where(eq(packageItemsTable.packageId, packageId));
+    const allDepleted = siblingItems.every((sibling) =>
+      sibling.id === packageItemRow.id ? nextRemainingQuantity <= 0 : sibling.remainingQuantity <= 0
+    );
+    if (allDepleted) {
+      await tx
+        .update(packagesTable)
+        .set({ status: "completed", updatedAt: new Date() })
+        .where(eq(packagesTable.id, packageId));
+    }
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after redeeming a package`);
   }
   return updated;
 }
