@@ -43,6 +43,13 @@
       "when": 1790660210442,
       "tag": "0005_dusty_morlocks",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790661914802,
+      "tag": "0006_stale_blacklash",
+      "breakpoints": true
     }
   ]
 }
