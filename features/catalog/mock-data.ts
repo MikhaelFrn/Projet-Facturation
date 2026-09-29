@@ -51,6 +51,19 @@ export const mockCatalogItems: CatalogItem[] = [
     updatedAt: now,
   },
   {
+    // Added for livrable 9's package example (doc §4.10: "3 × Soins du
+    // visage"), matched by name rather than reusing "Facial hydratant".
+    id: "service-soins-visage",
+    sku: "SRV-SOINS-VISAGE",
+    name: "Soins du visage",
+    itemType: "service",
+    unitPriceCents: 7000,
+    taxExempt: false,
+    active: true,
+    createdAt: now,
+    updatedAt: now,
+  },
+  {
     id: "product-creme-spf30",
     sku: "PRD-CREME-SPF30",
     name: "Crème hydratante SPF 30",
