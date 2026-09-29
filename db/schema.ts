@@ -245,6 +245,32 @@ export const invoiceNumberCounters = pgTable("invoice_number_counters", {
   lastValue: integer("last_value").notNull().default(0),
 });
 
+export type GiftCardStatus = "active" | "expired" | "depleted";
+
+// Livrable 8 (4.9): a prepaid credit identified by a unique code, redeemed
+// against an invoice's balance at checkout. Issuance isn't itself a listed
+// livrable (the doc only describes redemption), so this table exists mainly
+// to make redemption testable — see features/gift-cards/repository.ts.
+export const giftCards = pgTable(
+  "gift_cards",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    code: text("code").notNull(),
+    initialValueCents: integer("initial_value_cents").notNull(),
+    remainingBalanceCents: integer("remaining_balance_cents").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }), // null = never expires
+    status: text("status").notNull().default("active").$type<GiftCardStatus>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("gift_cards_code_key").on(table.code),
+    check("gift_cards_status_check", sql`${table.status} in ('active', 'expired', 'depleted')`),
+    check("gift_cards_initial_value_cents_check", sql`${table.initialValueCents} > 0`),
+    check("gift_cards_remaining_balance_cents_check", sql`${table.remainingBalanceCents} >= 0`),
+  ]
+);
+
 export const taxesRelations = relations(taxes, ({ many }) => ({
   invoiceItemTaxes: many(invoiceItemTaxes),
 }));

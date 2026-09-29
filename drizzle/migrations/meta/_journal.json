@@ -36,6 +36,13 @@
       "when": 1789578310346,
       "tag": "0004_strong_star_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790660210442,
+      "tag": "0005_dusty_morlocks",
+      "breakpoints": true
     }
   ]
 }
