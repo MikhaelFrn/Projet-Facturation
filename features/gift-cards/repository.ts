@@ -2,9 +2,31 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
 import { giftCards as giftCardsTable } from "@/db/schema";
-import { GiftCardCodeAlreadyExistsError } from "./errors";
+import {
+  GiftCardCodeAlreadyExistsError,
+  GiftCardInsufficientBalanceError,
+  GiftCardNotActiveError,
+} from "./errors";
 import { getMockGiftCardByCode, mockGiftCards } from "./mock-data";
 import type { GiftCard } from "./types";
+
+// Shared by redeemGiftCard's mock and real branches
+// (features/invoicing/repository.ts): the lazy expiresAt check matters
+// because nothing proactively flips a card's status column when it expires
+// — a card can still say 'active' after its expiry date, so expiresAt is
+// checked independently of status rather than trusted alone.
+export function assertGiftCardRedeemable(giftCard: GiftCard, requestedCents: number): void {
+  const isExpired = giftCard.expiresAt !== null && giftCard.expiresAt.getTime() < Date.now();
+  if (isExpired || giftCard.status === "expired") {
+    throw new GiftCardNotActiveError(giftCard.code, "expired");
+  }
+  if (giftCard.status === "depleted" || giftCard.remainingBalanceCents <= 0) {
+    throw new GiftCardNotActiveError(giftCard.code, "depleted");
+  }
+  if (requestedCents > giftCard.remainingBalanceCents) {
+    throw new GiftCardInsufficientBalanceError(giftCard.code, requestedCents, giftCard.remainingBalanceCents);
+  }
+}
 
 export interface CreateGiftCardInput {
   code: string;
