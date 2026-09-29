@@ -271,6 +271,71 @@ export const giftCards = pgTable(
   ]
 );
 
+export type PackageStatus = "active" | "expired" | "completed";
+
+// Livrable 9 (4.10): a pre-sold bundle of services/products tied to one
+// customer, redeemed by quantity rather than by dollar amount (unlike gift
+// cards). discountPercentMicros is the doc's optional "10% off additional
+// purchases" perk — stored, but NOT applied anywhere yet: that's a
+// materially different feature (discounting unrelated lines) than
+// redemption itself, deliberately deferred.
+export const packages = pgTable(
+  "packages",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    customerId: uuid("customer_id").notNull(), // loose reference, same as invoices.customerId
+    purchasedAt: timestamp("purchased_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }), // null = never expires
+    status: text("status").notNull().default("active").$type<PackageStatus>(),
+    discountPercentMicros: integer("discount_percent_micros"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("packages_customer_id_idx").on(table.customerId),
+    check("packages_status_check", sql`${table.status} in ('active', 'expired', 'completed')`),
+  ]
+);
+
+// One row per included service/product (doc: "6 × Massages suédois, il en
+// reste 4" is exactly initialQuantity=6, remainingQuantity=4). A single
+// table for both services and products, matching invoiceItems/catalogItems'
+// own itemType convention rather than two near-identical tables.
+export const packageItems = pgTable(
+  "package_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    packageId: uuid("package_id")
+      .notNull()
+      .references(() => packages.id, { onDelete: "cascade" }),
+    itemType: text("item_type").notNull().$type<InvoiceItemType>(),
+    catalogItemId: uuid("catalog_item_id").notNull(), // loose reference, same as invoiceItems.catalogItemId
+    description: text("description").notNull(), // snapshot name, e.g. "Massage suédois"
+    initialQuantity: integer("initial_quantity").notNull(),
+    remainingQuantity: integer("remaining_quantity").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("package_items_package_id_idx").on(table.packageId),
+    index("package_items_catalog_item_id_idx").on(table.catalogItemId),
+    check("package_items_item_type_check", sql`${table.itemType} in ('service', 'product')`),
+    check("package_items_initial_quantity_check", sql`${table.initialQuantity} > 0`),
+    check("package_items_remaining_quantity_check", sql`${table.remainingQuantity} >= 0`),
+  ]
+);
+
+export const packagesRelations = relations(packages, ({ many }) => ({
+  items: many(packageItems),
+}));
+
+export const packageItemsRelations = relations(packageItems, ({ one }) => ({
+  package: one(packages, {
+    fields: [packageItems.packageId],
+    references: [packages.id],
+  }),
+}));
+
 export const taxesRelations = relations(taxes, ({ many }) => ({
   invoiceItemTaxes: many(invoiceItemTaxes),
 }));
