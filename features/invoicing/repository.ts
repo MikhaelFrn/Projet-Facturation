@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
-import { invoiceItems, invoiceItemTaxes, invoices, payments } from "@/db/schema";
+import { giftCards as giftCardsTable, invoiceItems, invoiceItemTaxes, invoices, payments } from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
 import { getCatalogItem } from "@/features/catalog/repository";
 import type { CatalogItem } from "@/features/catalog/types";
+import { GiftCardNotFoundError } from "@/features/gift-cards/errors";
+import { getMockGiftCardByCode } from "@/features/gift-cards/mock-data";
+import { assertGiftCardRedeemable } from "@/features/gift-cards/repository";
 import { DEFAULT_TAX_JURISDICTION } from "@/features/taxes/calculate";
 import { listTaxes } from "@/features/taxes/repository";
 import {
@@ -895,6 +898,156 @@ async function setInvoiceTipReal(
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after setting tip`);
+  }
+  return updated;
+}
+
+export interface RedeemGiftCardInput {
+  code: string;
+  amountCents: number;
+}
+
+// 4.9: a gift card redemption is a payment (method 'gift_card') AND a
+// balance deduction happening together — if those aren't atomic, a crash
+// between them either records a payment with nothing backing it or drains
+// a card with no payment on the invoice. The real branch locks BOTH the
+// invoice row and the gift card row in one transaction (same technique as
+// recordPayment's overpayment race guard, extended to a second resource),
+// so two concurrent redemptions can never both read the same "before"
+// state and double-spend either the invoice's balance or the card's.
+export async function redeemGiftCard(
+  invoiceId: string,
+  input: RedeemGiftCardInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    return redeemGiftCardMock(invoiceId, input);
+  }
+  return redeemGiftCardReal(invoiceId, input);
+}
+
+function redeemGiftCardMock(invoiceId: string, input: RedeemGiftCardInput): InvoiceWithDetails {
+  const invoice = getMockInvoiceById(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoicePayable(invoice);
+
+  const giftCard = getMockGiftCardByCode(input.code);
+  if (!giftCard) {
+    throw new GiftCardNotFoundError(input.code);
+  }
+  assertGiftCardRedeemable(giftCard, input.amountCents);
+
+  const paidSoFar = invoice.payments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const remainingBalanceCents = invoice.totalCents - paidSoFar;
+
+  if (input.amountCents > remainingBalanceCents) {
+    throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+  }
+
+  const now = new Date();
+  const nextStatus: InvoiceStatus =
+    paidSoFar + input.amountCents >= invoice.totalCents ? "paid" : "partially_paid";
+
+  giftCard.remainingBalanceCents -= input.amountCents;
+  if (giftCard.remainingBalanceCents <= 0) {
+    giftCard.status = "depleted";
+  }
+  giftCard.updatedAt = now;
+
+  invoice.payments.push({
+    id: randomUUID(),
+    invoiceId,
+    method: "gift_card",
+    status: "completed",
+    amountCents: input.amountCents,
+    amountTenderedCents: null,
+    changeGivenCents: null,
+    reference: input.code,
+    createdAt: now,
+  });
+  invoice.status = nextStatus;
+  if (nextStatus === "paid") {
+    invoice.paidAt = now;
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function redeemGiftCardReal(
+  invoiceId: string,
+  input: RedeemGiftCardInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoicePayable(invoiceRow);
+
+    const [giftCardRow] = await tx
+      .select()
+      .from(giftCardsTable)
+      .where(eq(giftCardsTable.code, input.code))
+      .for("update");
+    if (!giftCardRow) {
+      throw new GiftCardNotFoundError(input.code);
+    }
+    assertGiftCardRedeemable(giftCardRow, input.amountCents);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const paidSoFar = existingPayments
+      .filter((payment) => payment.status === "completed")
+      .reduce((sum, payment) => sum + payment.amountCents, 0);
+    const remainingBalanceCents = invoiceRow.totalCents - paidSoFar;
+
+    if (input.amountCents > remainingBalanceCents) {
+      throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+    }
+
+    const now = new Date();
+    const nextStatus: InvoiceStatus =
+      paidSoFar + input.amountCents >= invoiceRow.totalCents ? "paid" : "partially_paid";
+
+    await tx.insert(payments).values({
+      invoiceId,
+      method: "gift_card",
+      status: "completed",
+      amountCents: input.amountCents,
+      reference: input.code,
+    });
+
+    const invoiceUpdateFields: Partial<typeof invoices.$inferInsert> = {
+      status: nextStatus,
+      updatedAt: now,
+    };
+    if (nextStatus === "paid") {
+      invoiceUpdateFields.paidAt = now;
+    }
+    await tx.update(invoices).set(invoiceUpdateFields).where(eq(invoices.id, invoiceId));
+
+    const nextGiftCardBalanceCents = giftCardRow.remainingBalanceCents - input.amountCents;
+    const giftCardUpdateFields: Partial<typeof giftCardsTable.$inferInsert> = {
+      remainingBalanceCents: nextGiftCardBalanceCents,
+      updatedAt: now,
+    };
+    if (nextGiftCardBalanceCents <= 0) {
+      giftCardUpdateFields.status = "depleted";
+    }
+    await tx.update(giftCardsTable).set(giftCardUpdateFields).where(eq(giftCardsTable.id, giftCardRow.id));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after redeeming a gift card`);
   }
   return updated;
 }
