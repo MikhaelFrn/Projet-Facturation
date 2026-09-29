@@ -572,6 +572,9 @@ export async function updateInvoiceItem(
   if (!currentItem) {
     throw new InvoiceItemNotFoundError(invoiceId, itemId);
   }
+  if (currentItem.packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+  }
 
   const quantity = input.quantity ?? currentItem.quantity;
   const discountType = input.discountType ?? currentItem.discountType;
@@ -685,6 +688,9 @@ export async function removeInvoiceItem(invoiceId: string, itemId: string): Prom
   const itemIndex = invoice.items.findIndex((item) => item.id === itemId);
   if (itemIndex === -1) {
     throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+  if (invoice.items[itemIndex].packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
   }
 
   if (!isDatabaseConfigured) {
