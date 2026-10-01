@@ -43,3 +43,13 @@ export const mockGiftCards: GiftCard[] = [
 export function getMockGiftCardByCode(code: string): GiftCard | undefined {
   return mockGiftCards.find((giftCard) => giftCard.code === code);
 }
+
+// Test-only: redeemGiftCard mutates remainingBalanceCents/status in place.
+// See features/invoicing/mock-data.ts's resetMockInvoices for why this
+// snapshot-and-restore pattern exists.
+const PRISTINE_MOCK_GIFT_CARDS = structuredClone(mockGiftCards);
+
+export function resetMockGiftCards(): void {
+  mockGiftCards.length = 0;
+  mockGiftCards.push(...structuredClone(PRISTINE_MOCK_GIFT_CARDS));
+}

@@ -179,7 +179,23 @@ export const mockInvoiceSplitPayment: InvoiceWithDetails = {
   invoiceNumber: "INV-2026-00413",
   tipCents: 0,
   totalCents: 16672,
-  items: mockInvoicePaid.items.map((item) => ({ ...item, tipCents: 0 })),
+  // Deep-remap ids/invoiceId/taxes rather than a shallow spread: a shallow
+  // `{ ...item }` would leave these items still claiming invoiceId "inv-1"
+  // and sharing their `taxes` array BY REFERENCE with mockInvoicePaid's own
+  // items (same class of bug as the refunds array fix above, just one level
+  // deeper) — any future code that mutates a line's taxes array in place
+  // (none does today) would silently corrupt both invoices at once.
+  items: mockInvoicePaid.items.map((item) => ({
+    ...item,
+    id: item.id.replace("inv-1", "inv-2"),
+    invoiceId: "inv-2",
+    tipCents: 0,
+    taxes: item.taxes.map((tax) => ({
+      ...tax,
+      id: tax.id.replace("inv-1", "inv-2"),
+      invoiceItemId: item.id.replace("inv-1", "inv-2"),
+    })),
+  })),
   payments: [
     {
       id: "inv-2-payment-1",
@@ -218,4 +234,17 @@ export const mockInvoices: InvoiceWithDetails[] = [
 
 export function getMockInvoiceById(id: string): InvoiceWithDetails | undefined {
   return mockInvoices.find((invoice) => invoice.id === id);
+}
+
+// Test-only: repository.ts mutates these objects in place (push a payment,
+// flip a status, splice out a line, …), and createInvoiceFromAppointment
+// pushes brand-new ones on top — without a way back to the pristine seed,
+// test order would leak state between cases. Snapshotted once at module
+// load, before anything has a chance to mutate it; structuredClone so each
+// reset hands out fresh objects instead of re-sharing the same ones.
+const PRISTINE_MOCK_INVOICES = structuredClone(mockInvoices);
+
+export function resetMockInvoices(): void {
+  mockInvoices.length = 0;
+  mockInvoices.push(...structuredClone(PRISTINE_MOCK_INVOICES));
 }
