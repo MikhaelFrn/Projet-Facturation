@@ -9,6 +9,7 @@ import {
   packageItems as packageItemsTable,
   packages as packagesTable,
   payments,
+  refunds,
 } from "@/db/schema";
 import { getAppointment } from "@/features/appointments/repository";
 import type { Appointment } from "@/features/appointments/types";
@@ -37,8 +38,11 @@ import {
   InvoiceNotEditableError,
   InvoiceNotFoundError,
   InvoiceNotPayableError,
+  InvoiceNotRefundableError,
+  InvoiceNotVoidableError,
   NoTipEligibleLinesError,
   PaymentExceedsBalanceError,
+  RefundExceedsNetPaidError,
 } from "./errors";
 import { generateInvoiceNumber } from "./invoice-number";
 import { getMockInvoiceById, mockInvoices } from "./mock-data";
@@ -65,6 +69,7 @@ import type {
   InvoiceWithDetails,
   Payment,
   PaymentMethod,
+  Refund,
   Tax,
 } from "./types";
 
@@ -92,6 +97,30 @@ function assertInvoicePayable(invoice: { id: string; status: InvoiceStatus }): v
   }
 }
 
+// 7.4: "Facture jamais ouverte → Changer statut → voided." Happens to equal
+// EDITABLE_INVOICE_STATUSES today, but kept as its own named constant since
+// the two guards answer different questions (can the lines still be
+// touched? vs. can the whole invoice be cancelled?) — same reasoning as
+// EDITABLE vs PAYABLE above.
+const VOIDABLE_INVOICE_STATUSES: InvoiceStatus[] = ["draft", "unpaid"];
+
+function assertInvoiceVoidable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!VOIDABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotVoidableError(invoice.id, invoice.status);
+  }
+}
+
+// 7.4: "Facture payée, erreur détectée → Créer un Refund." Only an invoice
+// that has actually collected money is refundable; a never-paid invoice
+// must be voided instead (see VOIDABLE_INVOICE_STATUSES above).
+const REFUNDABLE_INVOICE_STATUSES: InvoiceStatus[] = ["paid", "partially_paid"];
+
+function assertInvoiceRefundable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!REFUNDABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotRefundableError(invoice.id, invoice.status);
+  }
+}
+
 // Single switch point: every screen calls these two functions instead of
 // touching mock-data.ts or the Drizzle client directly. Once DATABASE_URL is
 // set in .env.local, isDatabaseConfigured flips to true and these start
@@ -107,6 +136,7 @@ export async function listInvoices(): Promise<InvoiceWithDetails[]> {
     with: {
       items: { with: { taxes: true }, orderBy: (items, { asc }) => asc(items.lineNumber) },
       payments: true,
+      refunds: true,
     },
   });
 }
@@ -122,6 +152,7 @@ export async function getInvoice(id: string): Promise<InvoiceWithDetails | undef
     with: {
       items: { with: { taxes: true }, orderBy: (items, { asc }) => asc(items.lineNumber) },
       payments: true,
+      refunds: true,
     },
   });
 }
@@ -226,6 +257,7 @@ async function createInvoiceFromAppointmentMock(appointment: Appointment): Promi
     voidedAt: null,
     items,
     payments: [],
+    refunds: [],
   };
 
   mockInvoices.push(invoice);
@@ -836,6 +868,157 @@ async function recordPaymentReal(
   const updated = await getInvoice(invoiceId);
   if (!updated) {
     throw new Error(`Invoice ${invoiceId} disappeared after recording a payment`);
+  }
+  return updated;
+}
+
+// 7.4 / 11: "Facture jamais ouverte → Changer statut → voided." No payment
+// ever existed on a voidable invoice (see VOIDABLE_INVOICE_STATUSES), so
+// unlike refundInvoice there's no balance to check — this is a pure status
+// flip.
+export async function voidInvoice(invoiceId: string): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = getMockInvoiceById(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceVoidable(invoice);
+
+    const now = new Date();
+    invoice.status = "voided";
+    invoice.voidedAt = now;
+    invoice.updatedAt = now;
+    return invoice;
+  }
+
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    // Same row-lock reasoning as recordPaymentReal: stops a concurrent
+    // payment/void racing against this one.
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceVoidable(invoiceRow);
+
+    const now = new Date();
+    await tx.update(invoices).set({ status: "voided", voidedAt: now, updatedAt: now }).where(eq(invoices.id, invoiceId));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after voiding`);
+  }
+  return updated;
+}
+
+export interface RefundInvoiceInput {
+  amountCents: number;
+  reason?: string | null;
+}
+
+function netPaidCents(
+  invoicePayments: { amountCents: number; status: string }[],
+  invoiceRefunds: { amountCents: number }[]
+): number {
+  const paidSoFar = invoicePayments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const refundedSoFar = invoiceRefunds.reduce((sum, refund) => sum + refund.amountCents, 0);
+  return paidSoFar - refundedSoFar;
+}
+
+// 7.4 / 11: "Facture payée, erreur détectée → Créer un Refund lié à la
+// facture originale." A refund is its own ledger row (db/schema.ts's
+// refunds table), not a flag on a payment — "net paid" (what's refundable)
+// is recomputed from payments minus refunds every time, same "never trust a
+// running total" principle as recalculateInvoiceTotalsReal/Mock. The
+// requis doc's status table (4.3) has no "partially_refunded" state, so
+// only a refund that exactly exhausts what's still net-paid flips the
+// invoice to 'refunded'; a smaller, partial refund leaves status untouched
+// and is tracked purely through the refunds rows themselves.
+export async function refundInvoice(
+  invoiceId: string,
+  input: RefundInvoiceInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = getMockInvoiceById(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    return refundInvoiceMock(invoice, input);
+  }
+
+  return refundInvoiceReal(invoiceId, input);
+}
+
+function refundInvoiceMock(invoice: InvoiceWithDetails, input: RefundInvoiceInput): InvoiceWithDetails {
+  assertInvoiceRefundable(invoice);
+
+  const maxRefundableCents = netPaidCents(invoice.payments, invoice.refunds);
+  if (input.amountCents > maxRefundableCents) {
+    throw new RefundExceedsNetPaidError(invoice.id, input.amountCents, maxRefundableCents);
+  }
+
+  const now = new Date();
+  const refund: Refund = {
+    id: randomUUID(),
+    invoiceId: invoice.id,
+    amountCents: input.amountCents,
+    reason: input.reason ?? null,
+    createdAt: now,
+  };
+
+  invoice.refunds.push(refund);
+  if (input.amountCents === maxRefundableCents) {
+    invoice.status = "refunded";
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function refundInvoiceReal(invoiceId: string, input: RefundInvoiceInput): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceRefundable(invoiceRow);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const existingRefunds = await tx
+      .select({ amountCents: refunds.amountCents })
+      .from(refunds)
+      .where(eq(refunds.invoiceId, invoiceId));
+
+    const maxRefundableCents = netPaidCents(existingPayments, existingRefunds);
+    if (input.amountCents > maxRefundableCents) {
+      throw new RefundExceedsNetPaidError(invoiceId, input.amountCents, maxRefundableCents);
+    }
+
+    await tx.insert(refunds).values({
+      invoiceId,
+      amountCents: input.amountCents,
+      reason: input.reason ?? null,
+    });
+
+    if (input.amountCents === maxRefundableCents) {
+      await tx
+        .update(invoices)
+        .set({ status: "refunded", updatedAt: new Date() })
+        .where(eq(invoices.id, invoiceId));
+    }
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after refunding`);
   }
   return updated;
 }

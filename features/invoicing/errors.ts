@@ -122,3 +122,46 @@ export class InvoiceItemAlreadyRedeemedError extends Error {
     this.name = "InvoiceItemAlreadyRedeemedError";
   }
 }
+
+// 7.4: "Facture jamais ouverte → Changer statut → voided". See
+// features/invoicing/repository.ts VOIDABLE_INVOICE_STATUSES for exactly
+// which statuses count — any invoice that has ever taken a real payment
+// must be refunded instead (see InvoiceNotRefundableError), never voided.
+export class InvoiceNotVoidableError extends Error {
+  constructor(
+    public readonly invoiceId: string,
+    public readonly status: string
+  ) {
+    super(`Invoice ${invoiceId} cannot be voided while its status is '${status}'`);
+    this.name = "InvoiceNotVoidableError";
+  }
+}
+
+// 7.4: "Facture payée, erreur détectée → Créer un Refund lié à la facture
+// originale". See features/invoicing/repository.ts
+// REFUNDABLE_INVOICE_STATUSES — a refund only makes sense once money has
+// actually been collected.
+export class InvoiceNotRefundableError extends Error {
+  constructor(
+    public readonly invoiceId: string,
+    public readonly status: string
+  ) {
+    super(`Invoice ${invoiceId} cannot be refunded while its status is '${status}'`);
+    this.name = "InvoiceNotRefundableError";
+  }
+}
+
+// A refund (alone or stacked on earlier ones) can never give back more than
+// was actually collected on the invoice.
+export class RefundExceedsNetPaidError extends Error {
+  constructor(
+    public readonly invoiceId: string,
+    public readonly amountCents: number,
+    public readonly maxRefundableCents: number
+  ) {
+    super(
+      `Refund of ${amountCents} exceeds invoice ${invoiceId}'s refundable balance of ${maxRefundableCents}`
+    );
+    this.name = "RefundExceedsNetPaidError";
+  }
+}
