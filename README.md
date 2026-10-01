@@ -294,10 +294,9 @@ duplicate, 422 business-rule conflict).
 | `POST /api/gift-cards` | Issue a gift card (minimal — issuance isn't a deliverable itself) |
 | `POST /api/packages` | Issue a package (minimal, same reasoning) |
 
-## Known limitations / explicitly out of scope
+## Known limitations
 
-Per the requirements doc's own scoping (§8), none of these are gaps to fix —
-they were deliberately left out of this module:
+Per the requirements doc's own scoping, these were deliberately left out of this module:
 
 - No physical payment terminal integration (Square recorded as a payment
   method, no real Square API call)
