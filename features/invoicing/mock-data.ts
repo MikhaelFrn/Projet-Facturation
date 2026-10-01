@@ -168,6 +168,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
       createdAt: now,
     },
   ],
+  refunds: [],
 };
 
 // Same three lines, no tip, closed with a split payment: gift card + credit
@@ -203,6 +204,11 @@ export const mockInvoiceSplitPayment: InvoiceWithDetails = {
       createdAt: now,
     },
   ],
+  // Explicit, separate array: without this, the `...mockInvoicePaid` spread
+  // above would leave this invoice sharing mockInvoicePaid's refunds array
+  // by reference (not overridden like items/payments are), so refunding one
+  // invoice would silently show up against the other's balance too.
+  refunds: [],
 };
 
 export const mockInvoices: InvoiceWithDetails[] = [
