@@ -50,6 +50,13 @@
       "when": 1790661914802,
       "tag": "0006_stale_blacklash",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790820880496,
+      "tag": "0007_heavy_mentallo",
+      "breakpoints": true
     }
   ]
 }

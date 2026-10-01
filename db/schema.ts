@@ -236,6 +236,32 @@ export const payments = pgTable(
   ]
 );
 
+// 7.4 / 11: a refund is its own ledger entry against an invoice (doc:
+// "Créer un Refund lié à la facture originale"), not a flag flipped on an
+// existing payment — a payment row stays the historical record of what was
+// collected, a refund row records what was given back, and the two are
+// summed independently (see features/invoicing/repository.ts's
+// refundInvoice). No "partially_refunded" status exists in the invoices
+// check constraint above, so a partial refund leaves the invoice's status
+// untouched; only a refund that matches everything paid so far flips it to
+// 'refunded'.
+export const refunds = pgTable(
+  "refunds",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references(() => invoices.id, { onDelete: "cascade" }),
+    amountCents: integer("amount_cents").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("refunds_invoice_id_idx").on(table.invoiceId),
+    check("refunds_amount_cents_check", sql`${table.amountCents} > 0`),
+  ]
+);
+
 // Backs generateInvoiceNumber() (features/invoicing/invoice-number.ts): one
 // row per calendar year, incremented atomically via an upsert so concurrent
 // checkouts never get the same number. Produces INV-{year}-{lastValue,
@@ -343,6 +369,7 @@ export const taxesRelations = relations(taxes, ({ many }) => ({
 export const invoicesRelations = relations(invoices, ({ many }) => ({
   items: many(invoiceItems),
   payments: many(payments),
+  refunds: many(refunds),
 }));
 
 export const invoiceItemsRelations = relations(invoiceItems, ({ one, many }) => ({
@@ -367,6 +394,13 @@ export const invoiceItemTaxesRelations = relations(invoiceItemTaxes, ({ one }) =
 export const paymentsRelations = relations(payments, ({ one }) => ({
   invoice: one(invoices, {
     fields: [payments.invoiceId],
+    references: [invoices.id],
+  }),
+}));
+
+export const refundsRelations = relations(refunds, ({ one }) => ({
+  invoice: one(invoices, {
+    fields: [refunds.invoiceId],
     references: [invoices.id],
   }),
 }));
