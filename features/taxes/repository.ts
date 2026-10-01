@@ -37,11 +37,11 @@ export interface UpdateTaxInput {
   active?: boolean;
 }
 
-// Livrable 10 ("UI Paramètres: gestion des taxes") lists no API of its own,
-// so managing tax profiles is this livrable's job — the settings screen is
-// meant to be built on top of these four functions. Full rows (active and
-// inactive) are returned; filtering to what actually applies to a given
-// line happens in tax-calculation.ts's selectApplicableTaxes, not here.
+// Livrable 10 ("UI Paramètres: gestion des taxes") lists no API of its own
+// — components/TaxSettingsPanel.tsx is built entirely on these four
+// functions (via the /api/taxes routes). Full rows (active and inactive)
+// are returned; filtering to what actually applies to a given line happens
+// in tax-calculation.ts's selectApplicableTaxes, not here.
 export async function listTaxes(): Promise<Tax[]> {
   if (!isDatabaseConfigured) {
     return mockTaxes;
