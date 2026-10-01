@@ -1,0 +1,1 @@
+ALTER TABLE "invoices" ADD CONSTRAINT "invoices_appointment_id_key" UNIQUE("appointment_id");

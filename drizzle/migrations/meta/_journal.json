@@ -8,6 +8,55 @@
       "when": 1787239075168,
       "tag": "0000_sparkling_iceman",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789489071572,
+      "tag": "0001_elite_ben_urich",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789489990483,
+      "tag": "0002_woozy_blindfold",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789577666093,
+      "tag": "0003_equal_plazm",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789578310346,
+      "tag": "0004_strong_star_brand",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790660210442,
+      "tag": "0005_dusty_morlocks",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790661914802,
+      "tag": "0006_stale_blacklash",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790820880496,
+      "tag": "0007_heavy_mentallo",
+      "breakpoints": true
     }
   ]
 }

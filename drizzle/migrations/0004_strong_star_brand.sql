@@ -1,0 +1,1 @@
+ALTER TABLE "invoice_item_taxes" ADD COLUMN "tax_included_in_price" boolean DEFAULT false NOT NULL;

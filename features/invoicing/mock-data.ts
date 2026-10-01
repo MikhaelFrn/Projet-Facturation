@@ -1,37 +1,9 @@
-import type { InvoiceWithDetails, Tax } from "./types";
+import type { InvoiceWithDetails } from "./types";
 
 // Numbers below are taken straight from the requis doc's worked examples
 // (section 4.5 "Exemple de calcul (Québec)" and section 4.8 "Paiement
 // fractionné") so the totals here can be checked by hand against the doc.
-
-export const mockTaxes: Tax[] = [
-  {
-    id: "tax-tps",
-    name: "TPS",
-    rateMicros: 50_000, // 5.000%
-    country: "CA",
-    region: null,
-    appliesTo: "both",
-    includedInPrice: false,
-    calculationOrder: 1,
-    active: true,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-    updatedAt: new Date("2026-01-01T00:00:00Z"),
-  },
-  {
-    id: "tax-tvq",
-    name: "TVQ",
-    rateMicros: 99_750, // 9.975%, computed on the pre-TPS subtotal
-    country: "CA",
-    region: "QC",
-    appliesTo: "both",
-    includedInPrice: false,
-    calculationOrder: 2,
-    active: true,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-    updatedAt: new Date("2026-01-01T00:00:00Z"),
-  },
-];
+// Tax profiles themselves now live in features/taxes/mock-data.ts.
 
 const now = new Date("2026-08-05T14:30:00Z");
 
@@ -82,6 +54,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tps",
           taxName: "TPS",
           taxRateMicros: 50_000,
+          taxIncludedInPrice: false,
           calculationOrder: 1,
           taxAmountCents: 300,
         },
@@ -91,6 +64,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tvq",
           taxName: "TVQ",
           taxRateMicros: 99_750,
+          taxIncludedInPrice: false,
           calculationOrder: 2,
           taxAmountCents: 599,
         },
@@ -122,6 +96,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tps",
           taxName: "TPS",
           taxRateMicros: 50_000,
+          taxIncludedInPrice: false,
           calculationOrder: 1,
           taxAmountCents: 200,
         },
@@ -131,6 +106,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tvq",
           taxName: "TVQ",
           taxRateMicros: 99_750,
+          taxIncludedInPrice: false,
           calculationOrder: 2,
           taxAmountCents: 399,
         },
@@ -162,6 +138,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tps",
           taxName: "TPS",
           taxRateMicros: 50_000,
+          taxIncludedInPrice: false,
           calculationOrder: 1,
           taxAmountCents: 225,
         },
@@ -171,6 +148,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
           taxId: "tax-tvq",
           taxName: "TVQ",
           taxRateMicros: 99_750,
+          taxIncludedInPrice: false,
           calculationOrder: 2,
           taxAmountCents: 449,
         },
@@ -190,6 +168,7 @@ export const mockInvoicePaid: InvoiceWithDetails = {
       createdAt: now,
     },
   ],
+  refunds: [],
 };
 
 // Same three lines, no tip, closed with a split payment: gift card + credit
@@ -200,7 +179,23 @@ export const mockInvoiceSplitPayment: InvoiceWithDetails = {
   invoiceNumber: "INV-2026-00413",
   tipCents: 0,
   totalCents: 16672,
-  items: mockInvoicePaid.items.map((item) => ({ ...item, tipCents: 0 })),
+  // Deep-remap ids/invoiceId/taxes rather than a shallow spread: a shallow
+  // `{ ...item }` would leave these items still claiming invoiceId "inv-1"
+  // and sharing their `taxes` array BY REFERENCE with mockInvoicePaid's own
+  // items (same class of bug as the refunds array fix above, just one level
+  // deeper) — any future code that mutates a line's taxes array in place
+  // (none does today) would silently corrupt both invoices at once.
+  items: mockInvoicePaid.items.map((item) => ({
+    ...item,
+    id: item.id.replace("inv-1", "inv-2"),
+    invoiceId: "inv-2",
+    tipCents: 0,
+    taxes: item.taxes.map((tax) => ({
+      ...tax,
+      id: tax.id.replace("inv-1", "inv-2"),
+      invoiceItemId: item.id.replace("inv-1", "inv-2"),
+    })),
+  })),
   payments: [
     {
       id: "inv-2-payment-1",
@@ -225,6 +220,11 @@ export const mockInvoiceSplitPayment: InvoiceWithDetails = {
       createdAt: now,
     },
   ],
+  // Explicit, separate array: without this, the `...mockInvoicePaid` spread
+  // above would leave this invoice sharing mockInvoicePaid's refunds array
+  // by reference (not overridden like items/payments are), so refunding one
+  // invoice would silently show up against the other's balance too.
+  refunds: [],
 };
 
 export const mockInvoices: InvoiceWithDetails[] = [
@@ -234,4 +234,17 @@ export const mockInvoices: InvoiceWithDetails[] = [
 
 export function getMockInvoiceById(id: string): InvoiceWithDetails | undefined {
   return mockInvoices.find((invoice) => invoice.id === id);
+}
+
+// Test-only: repository.ts mutates these objects in place (push a payment,
+// flip a status, splice out a line, …), and createInvoiceFromAppointment
+// pushes brand-new ones on top — without a way back to the pristine seed,
+// test order would leak state between cases. Snapshotted once at module
+// load, before anything has a chance to mutate it; structuredClone so each
+// reset hands out fresh objects instead of re-sharing the same ones.
+const PRISTINE_MOCK_INVOICES = structuredClone(mockInvoices);
+
+export function resetMockInvoices(): void {
+  mockInvoices.length = 0;
+  mockInvoices.push(...structuredClone(PRISTINE_MOCK_INVOICES));
 }

@@ -47,6 +47,29 @@ export type PaymentStatus = "pending" | "completed" | "refunded" | "voided";
 
 export type TaxAppliesTo = "services" | "products" | "both";
 
+// Livrable 3: catalog of services/products a réceptionniste can search and
+// add to an invoice (requis doc section 4.4). No other module owns this data
+// (unlike Appointment — see features/appointments/types.ts), so it lives here.
+export const catalogItems = pgTable(
+  "catalog_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    sku: text("sku").notNull(),
+    name: text("name").notNull(),
+    itemType: text("item_type").notNull().$type<InvoiceItemType>(),
+    unitPriceCents: integer("unit_price_cents").notNull(),
+    taxExempt: boolean("tax_exempt").notNull().default(false), // requis doc section 5 "Exemptions"
+    active: boolean("active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("catalog_items_sku_key").on(table.sku),
+    index("catalog_items_name_idx").on(table.name),
+    check("catalog_items_item_type_check", sql`${table.itemType} in ('service', 'product')`),
+  ]
+);
+
 // 5. Tax profiles (Paramètres > Taxes)
 export const taxes = pgTable(
   "taxes",
@@ -99,6 +122,13 @@ export const invoices = pgTable(
   },
   (table) => [
     unique("invoices_invoice_number_key").on(table.invoiceNumber),
+    // Postgres treats NULLs as distinct from each other in a unique
+    // constraint, so this only blocks a *second* invoice for the same
+    // appointment — invoices with no appointment (appointmentId null) are
+    // unaffected. Backstops the application-level check in
+    // createInvoiceFromAppointment() against a race between the read and
+    // the insert.
+    unique("invoices_appointment_id_key").on(table.appointmentId),
     index("invoices_status_idx").on(table.status),
     index("invoices_customer_id_idx").on(table.customerId),
     check(
@@ -163,6 +193,10 @@ export const invoiceItemTaxes = pgTable(
     taxId: uuid("tax_id").references(() => taxes.id), // loose reference to the profile that produced this line
     taxName: text("tax_name").notNull(), // snapshot
     taxRateMicros: integer("tax_rate_micros").notNull(), // snapshot
+    // Livrable 3: snapshotted so updateInvoiceItem can reprice a line (new
+    // quantity/discount) using the SAME tax rules that applied when the line
+    // was added, without re-reading (and trusting) the current taxes table.
+    taxIncludedInPrice: boolean("tax_included_in_price").notNull().default(false),
     calculationOrder: integer("calculation_order").notNull().default(1),
     taxAmountCents: integer("tax_amount_cents").notNull(),
   },
@@ -202,6 +236,132 @@ export const payments = pgTable(
   ]
 );
 
+// 7.4 / 11: a refund is its own ledger entry against an invoice (doc:
+// "Créer un Refund lié à la facture originale"), not a flag flipped on an
+// existing payment — a payment row stays the historical record of what was
+// collected, a refund row records what was given back, and the two are
+// summed independently (see features/invoicing/repository.ts's
+// refundInvoice). No "partially_refunded" status exists in the invoices
+// check constraint above, so a partial refund leaves the invoice's status
+// untouched; only a refund that matches everything paid so far flips it to
+// 'refunded'.
+export const refunds = pgTable(
+  "refunds",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references(() => invoices.id, { onDelete: "cascade" }),
+    amountCents: integer("amount_cents").notNull(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("refunds_invoice_id_idx").on(table.invoiceId),
+    check("refunds_amount_cents_check", sql`${table.amountCents} > 0`),
+  ]
+);
+
+// Backs generateInvoiceNumber() (features/invoicing/invoice-number.ts): one
+// row per calendar year, incremented atomically via an upsert so concurrent
+// checkouts never get the same number. Produces INV-{year}-{lastValue,
+// zero-padded to 5 digits}, e.g. INV-2026-00412.
+export const invoiceNumberCounters = pgTable("invoice_number_counters", {
+  year: integer("year").primaryKey(),
+  lastValue: integer("last_value").notNull().default(0),
+});
+
+export type GiftCardStatus = "active" | "expired" | "depleted";
+
+// Livrable 8 (4.9): a prepaid credit identified by a unique code, redeemed
+// against an invoice's balance at checkout. Issuance isn't itself a listed
+// livrable (the doc only describes redemption), so this table exists mainly
+// to make redemption testable — see features/gift-cards/repository.ts.
+export const giftCards = pgTable(
+  "gift_cards",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    code: text("code").notNull(),
+    initialValueCents: integer("initial_value_cents").notNull(),
+    remainingBalanceCents: integer("remaining_balance_cents").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }), // null = never expires
+    status: text("status").notNull().default("active").$type<GiftCardStatus>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("gift_cards_code_key").on(table.code),
+    check("gift_cards_status_check", sql`${table.status} in ('active', 'expired', 'depleted')`),
+    check("gift_cards_initial_value_cents_check", sql`${table.initialValueCents} > 0`),
+    check("gift_cards_remaining_balance_cents_check", sql`${table.remainingBalanceCents} >= 0`),
+  ]
+);
+
+export type PackageStatus = "active" | "expired" | "completed";
+
+// Livrable 9 (4.10): a pre-sold bundle of services/products tied to one
+// customer, redeemed by quantity rather than by dollar amount (unlike gift
+// cards). discountPercentMicros is the doc's optional "10% off additional
+// purchases" perk — stored, but NOT applied anywhere yet: that's a
+// materially different feature (discounting unrelated lines) than
+// redemption itself, deliberately deferred.
+export const packages = pgTable(
+  "packages",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    customerId: uuid("customer_id").notNull(), // loose reference, same as invoices.customerId
+    purchasedAt: timestamp("purchased_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }), // null = never expires
+    status: text("status").notNull().default("active").$type<PackageStatus>(),
+    discountPercentMicros: integer("discount_percent_micros"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("packages_customer_id_idx").on(table.customerId),
+    check("packages_status_check", sql`${table.status} in ('active', 'expired', 'completed')`),
+  ]
+);
+
+// One row per included service/product (doc: "6 × Massages suédois, il en
+// reste 4" is exactly initialQuantity=6, remainingQuantity=4). A single
+// table for both services and products, matching invoiceItems/catalogItems'
+// own itemType convention rather than two near-identical tables.
+export const packageItems = pgTable(
+  "package_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    packageId: uuid("package_id")
+      .notNull()
+      .references(() => packages.id, { onDelete: "cascade" }),
+    itemType: text("item_type").notNull().$type<InvoiceItemType>(),
+    catalogItemId: uuid("catalog_item_id").notNull(), // loose reference, same as invoiceItems.catalogItemId
+    description: text("description").notNull(), // snapshot name, e.g. "Massage suédois"
+    initialQuantity: integer("initial_quantity").notNull(),
+    remainingQuantity: integer("remaining_quantity").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index("package_items_package_id_idx").on(table.packageId),
+    index("package_items_catalog_item_id_idx").on(table.catalogItemId),
+    check("package_items_item_type_check", sql`${table.itemType} in ('service', 'product')`),
+    check("package_items_initial_quantity_check", sql`${table.initialQuantity} > 0`),
+    check("package_items_remaining_quantity_check", sql`${table.remainingQuantity} >= 0`),
+  ]
+);
+
+export const packagesRelations = relations(packages, ({ many }) => ({
+  items: many(packageItems),
+}));
+
+export const packageItemsRelations = relations(packageItems, ({ one }) => ({
+  package: one(packages, {
+    fields: [packageItems.packageId],
+    references: [packages.id],
+  }),
+}));
+
 export const taxesRelations = relations(taxes, ({ many }) => ({
   invoiceItemTaxes: many(invoiceItemTaxes),
 }));
@@ -209,6 +369,7 @@ export const taxesRelations = relations(taxes, ({ many }) => ({
 export const invoicesRelations = relations(invoices, ({ many }) => ({
   items: many(invoiceItems),
   payments: many(payments),
+  refunds: many(refunds),
 }));
 
 export const invoiceItemsRelations = relations(invoiceItems, ({ one, many }) => ({
@@ -233,6 +394,13 @@ export const invoiceItemTaxesRelations = relations(invoiceItemTaxes, ({ one }) =
 export const paymentsRelations = relations(payments, ({ one }) => ({
   invoice: one(invoices, {
     fields: [payments.invoiceId],
+    references: [invoices.id],
+  }),
+}));
+
+export const refundsRelations = relations(refunds, ({ one }) => ({
+  invoice: one(invoices, {
+    fields: [refunds.invoiceId],
     references: [invoices.id],
   }),
 }));

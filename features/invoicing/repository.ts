@@ -1,8 +1,125 @@
-import { eq } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import { and, eq } from "drizzle-orm";
 import { getDb, isDatabaseConfigured } from "@/db/client";
-import { invoices } from "@/db/schema";
+import {
+  giftCards as giftCardsTable,
+  invoiceItems,
+  invoiceItemTaxes,
+  invoices,
+  packageItems as packageItemsTable,
+  packages as packagesTable,
+  payments,
+  refunds,
+} from "@/db/schema";
+import { getAppointment } from "@/features/appointments/repository";
+import type { Appointment } from "@/features/appointments/types";
+import { getCatalogItem } from "@/features/catalog/repository";
+import type { CatalogItem } from "@/features/catalog/types";
+import { GiftCardNotFoundError } from "@/features/gift-cards/errors";
+import { getMockGiftCardByCode } from "@/features/gift-cards/mock-data";
+import { assertGiftCardRedeemable } from "@/features/gift-cards/repository";
+import {
+  PackageCustomerMismatchError,
+  PackageInsufficientQuantityError,
+  PackageItemNotFoundError,
+  PackageNotActiveError,
+  PackageNotFoundError,
+} from "@/features/packages/errors";
+import { getMockPackageById, getMockPackageItemsByPackageId } from "@/features/packages/mock-data";
+import { DEFAULT_TAX_JURISDICTION } from "@/features/taxes/calculate";
+import { listTaxes } from "@/features/taxes/repository";
+import {
+  AppointmentAlreadyInvoicedError,
+  AppointmentNotCompletedError,
+  AppointmentNotFoundError,
+  CatalogItemNotFoundError,
+  InvoiceItemAlreadyRedeemedError,
+  InvoiceItemNotFoundError,
+  InvoiceNotEditableError,
+  InvoiceNotFoundError,
+  InvoiceNotPayableError,
+  InvoiceNotRefundableError,
+  InvoiceNotVoidableError,
+  NoTipEligibleLinesError,
+  PaymentExceedsBalanceError,
+  RefundExceedsNetPaidError,
+} from "./errors";
+import { generateInvoiceNumber } from "./invoice-number";
 import { getMockInvoiceById, mockInvoices } from "./mock-data";
-import type { InvoiceWithDetails } from "./types";
+import {
+  calculateLineTaxes,
+  computeLineGrossAmountCents,
+  selectApplicableTaxes,
+  taxRateInputsFromSnapshot,
+  type LineTaxCalculation,
+} from "./tax-calculation";
+import {
+  computeTipTotalCents,
+  prorateTip,
+  type ManualTipAmount,
+  type TipBase,
+  type TipDistribution,
+  type TipMode,
+} from "./tip-calculation";
+import type {
+  DiscountType,
+  InvoiceItem,
+  InvoiceItemTax,
+  InvoiceStatus,
+  InvoiceWithDetails,
+  Payment,
+  PaymentMethod,
+  Refund,
+  Tax,
+} from "./types";
+
+// 7.1: a closed invoice can never be modified directly. Extended past the
+// doc's literal "paid" example to partially_paid too — editing a line after
+// any payment exists would silently invalidate the "solde restant" math
+// against that payment.
+const EDITABLE_INVOICE_STATUSES: InvoiceStatus[] = ["draft", "unpaid"];
+
+function assertInvoiceEditable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!EDITABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotEditableError(invoice.id, invoice.status);
+  }
+}
+
+// 4.8: distinct from EDITABLE_INVOICE_STATUSES — a partially_paid invoice
+// can't have its lines touched anymore, but must still be able to take more
+// payments (that's the whole point of a split payment). draft is excluded:
+// nothing to collect on an invoice that hasn't been submitted yet.
+const PAYABLE_INVOICE_STATUSES: InvoiceStatus[] = ["unpaid", "partially_paid"];
+
+function assertInvoicePayable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!PAYABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotPayableError(invoice.id, invoice.status);
+  }
+}
+
+// 7.4: "Facture jamais ouverte → Changer statut → voided." Happens to equal
+// EDITABLE_INVOICE_STATUSES today, but kept as its own named constant since
+// the two guards answer different questions (can the lines still be
+// touched? vs. can the whole invoice be cancelled?) — same reasoning as
+// EDITABLE vs PAYABLE above.
+const VOIDABLE_INVOICE_STATUSES: InvoiceStatus[] = ["draft", "unpaid"];
+
+function assertInvoiceVoidable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!VOIDABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotVoidableError(invoice.id, invoice.status);
+  }
+}
+
+// 7.4: "Facture payée, erreur détectée → Créer un Refund." Only an invoice
+// that has actually collected money is refundable; a never-paid invoice
+// must be voided instead (see VOIDABLE_INVOICE_STATUSES above).
+const REFUNDABLE_INVOICE_STATUSES: InvoiceStatus[] = ["paid", "partially_paid"];
+
+function assertInvoiceRefundable(invoice: { id: string; status: InvoiceStatus }): void {
+  if (!REFUNDABLE_INVOICE_STATUSES.includes(invoice.status)) {
+    throw new InvoiceNotRefundableError(invoice.id, invoice.status);
+  }
+}
 
 // Single switch point: every screen calls these two functions instead of
 // touching mock-data.ts or the Drizzle client directly. Once DATABASE_URL is
@@ -19,6 +136,7 @@ export async function listInvoices(): Promise<InvoiceWithDetails[]> {
     with: {
       items: { with: { taxes: true }, orderBy: (items, { asc }) => asc(items.lineNumber) },
       payments: true,
+      refunds: true,
     },
   });
 }
@@ -34,6 +152,1339 @@ export async function getInvoice(id: string): Promise<InvoiceWithDetails | undef
     with: {
       items: { with: { taxes: true }, orderBy: (items, { asc }) => asc(items.lineNumber) },
       payments: true,
+      refunds: true,
     },
   });
+}
+
+// 4.1 Create a draft invoice from a completed appointment. Every service on
+// the appointment becomes an invoice line, priced and taxed on the spot;
+// products, discounts and tip are added later in the checkout flow (4.4/4.6),
+// not here.
+export async function createInvoiceFromAppointment(appointmentId: string): Promise<InvoiceWithDetails> {
+  const appointment = await getAppointment(appointmentId);
+  if (!appointment) {
+    throw new AppointmentNotFoundError(appointmentId);
+  }
+  if (appointment.status !== "completed") {
+    throw new AppointmentNotCompletedError(appointmentId);
+  }
+
+  if (!isDatabaseConfigured) {
+    const existing = mockInvoices.find((invoice) => invoice.appointmentId === appointmentId);
+    if (existing) {
+      throw new AppointmentAlreadyInvoicedError(appointmentId, existing.id);
+    }
+    return createInvoiceFromAppointmentMock(appointment);
+  }
+
+  return createInvoiceFromAppointmentReal(appointment);
+}
+
+function priceAppointmentServices(appointment: Appointment, taxProfiles: Tax[]) {
+  const applicableTaxes = selectApplicableTaxes(taxProfiles, {
+    itemType: "service",
+    ...DEFAULT_TAX_JURISDICTION,
+  });
+
+  return appointment.services.map((service, index) => ({
+    lineNumber: index + 1,
+    service,
+    taxCalc: calculateLineTaxes(service.unitPriceCents, applicableTaxes),
+  }));
+}
+
+async function createInvoiceFromAppointmentMock(appointment: Appointment): Promise<InvoiceWithDetails> {
+  const taxProfiles = await listTaxes();
+  const priced = priceAppointmentServices(appointment, taxProfiles);
+  const invoiceNumber = await generateInvoiceNumber();
+  const invoiceId = randomUUID();
+  const now = new Date();
+
+  const items = priced.map(({ lineNumber, service, taxCalc }) => {
+    const itemId = randomUUID();
+    return {
+      id: itemId,
+      invoiceId,
+      lineNumber,
+      itemType: "service" as const,
+      catalogItemId: service.id,
+      description: service.description,
+      employeeId: service.employeeId,
+      employeeName: service.employeeName,
+      quantity: 1,
+      unitPriceCents: service.unitPriceCents,
+      discountType: "none" as const,
+      discountAmountCents: 0,
+      discountPercentMicros: 0,
+      packageRedemptionId: null,
+      tipCents: 0,
+      subtotalCents: taxCalc.subtotalCents,
+      taxAmountCents: taxCalc.taxAmountCents,
+      createdAt: now,
+      taxes: taxCalc.taxes.map((tax) => ({
+        id: randomUUID(),
+        invoiceItemId: itemId,
+        taxId: tax.taxId,
+        taxName: tax.taxName,
+        taxRateMicros: tax.taxRateMicros,
+        taxIncludedInPrice: tax.taxIncludedInPrice,
+        calculationOrder: tax.calculationOrder,
+        taxAmountCents: tax.taxAmountCents,
+      })),
+    };
+  });
+
+  const subtotalCents = items.reduce((sum, item) => sum + item.subtotalCents, 0);
+  const taxTotalCents = items.reduce((sum, item) => sum + item.taxAmountCents, 0);
+
+  const invoice: InvoiceWithDetails = {
+    id: invoiceId,
+    invoiceNumber,
+    status: "unpaid",
+    customerId: appointment.customerId,
+    customerName: appointment.customerName,
+    appointmentId: appointment.id,
+    subtotalCents,
+    taxTotalCents,
+    tipCents: 0,
+    totalCents: subtotalCents + taxTotalCents,
+    notesInternal: null,
+    notesCustomer: null,
+    createdAt: now,
+    updatedAt: now,
+    paidAt: null,
+    voidedAt: null,
+    items,
+    payments: [],
+    refunds: [],
+  };
+
+  mockInvoices.push(invoice);
+  return invoice;
+}
+
+async function createInvoiceFromAppointmentReal(appointment: Appointment): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  const existing = await db.query.invoices.findFirst({
+    where: eq(invoices.appointmentId, appointment.id),
+  });
+  if (existing) {
+    throw new AppointmentAlreadyInvoicedError(appointment.id, existing.id);
+  }
+
+  const taxProfiles = await listTaxes();
+  const priced = priceAppointmentServices(appointment, taxProfiles);
+  const invoiceNumber = await generateInvoiceNumber();
+
+  const subtotalCents = priced.reduce((sum, p) => sum + p.taxCalc.subtotalCents, 0);
+  const taxTotalCents = priced.reduce((sum, p) => sum + p.taxCalc.taxAmountCents, 0);
+
+  let createdInvoiceId: string;
+  try {
+    createdInvoiceId = await db.transaction(async (tx) => {
+      const [insertedInvoice] = await tx
+        .insert(invoices)
+        .values({
+          invoiceNumber,
+          status: "unpaid",
+          customerId: appointment.customerId,
+          customerName: appointment.customerName,
+          appointmentId: appointment.id,
+          subtotalCents,
+          taxTotalCents,
+          tipCents: 0,
+          totalCents: subtotalCents + taxTotalCents,
+        })
+        .returning({ id: invoices.id });
+
+      const insertedItems = await tx
+        .insert(invoiceItems)
+        .values(
+          priced.map(({ lineNumber, service, taxCalc }) => ({
+            invoiceId: insertedInvoice.id,
+            lineNumber,
+            itemType: "service" as const,
+            catalogItemId: service.id,
+            description: service.description,
+            employeeId: service.employeeId,
+            employeeName: service.employeeName,
+            quantity: 1,
+            unitPriceCents: service.unitPriceCents,
+            subtotalCents: taxCalc.subtotalCents,
+            taxAmountCents: taxCalc.taxAmountCents,
+          }))
+        )
+        .returning({ id: invoiceItems.id, lineNumber: invoiceItems.lineNumber });
+
+      const itemTaxRows = priced.flatMap(({ lineNumber, taxCalc }) => {
+        const insertedItem = insertedItems.find((item) => item.lineNumber === lineNumber);
+        if (!insertedItem) {
+          throw new Error(`No inserted invoice_item found for line ${lineNumber}`);
+        }
+        return taxCalc.taxes.map((tax) => ({
+          invoiceItemId: insertedItem.id,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }));
+      });
+
+      if (itemTaxRows.length > 0) {
+        await tx.insert(invoiceItemTaxes).values(itemTaxRows);
+      }
+
+      return insertedInvoice.id;
+    });
+  } catch (error) {
+    // Race against another concurrent checkout of the same appointment: the
+    // `existing` check above passed for both requests, then both reached the
+    // insert. invoices_appointment_id_key (db/schema.ts) is what actually
+    // stops the duplicate row; this just translates its failure into the
+    // same clean domain error the pre-check above throws.
+    if (isUniqueViolation(error, "invoices_appointment_id_key")) {
+      const winner = await db.query.invoices.findFirst({
+        where: eq(invoices.appointmentId, appointment.id),
+      });
+      if (winner) {
+        throw new AppointmentAlreadyInvoicedError(appointment.id, winner.id);
+      }
+    }
+    throw error;
+  }
+
+  const created = await getInvoice(createdInvoiceId);
+  if (!created) {
+    throw new Error(`Invoice ${createdInvoiceId} was created but could not be re-fetched`);
+  }
+  return created;
+}
+
+function isUniqueViolation(error: unknown, constraintName: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "23505" &&
+    "constraint_name" in error &&
+    error.constraint_name === constraintName
+  );
+}
+
+// Unwraps the `tx` parameter type from db.transaction's callback, so the
+// recompute helper below can be typed without importing drizzle's internal
+// transaction type by name.
+type InvoicingTx = Parameters<ReturnType<typeof getDb>["transaction"]>[0] extends (
+  tx: infer T,
+  ...args: never[]
+) => unknown
+  ? T
+  : never;
+
+// Shared by addInvoiceItem/updateInvoiceItem/removeInvoiceItem (4.4): always
+// re-sums straight from invoice_items rather than adjusting the invoice's
+// existing totals incrementally, so a drift never compounds.
+async function recalculateInvoiceTotalsReal(tx: InvoicingTx, invoiceId: string): Promise<void> {
+  const items = await tx
+    .select({ subtotalCents: invoiceItems.subtotalCents, taxAmountCents: invoiceItems.taxAmountCents })
+    .from(invoiceItems)
+    .where(eq(invoiceItems.invoiceId, invoiceId));
+
+  const subtotalCents = items.reduce((sum, item) => sum + item.subtotalCents, 0);
+  const taxTotalCents = items.reduce((sum, item) => sum + item.taxAmountCents, 0);
+
+  const [invoiceRow] = await tx
+    .select({ tipCents: invoices.tipCents })
+    .from(invoices)
+    .where(eq(invoices.id, invoiceId));
+
+  await tx
+    .update(invoices)
+    .set({
+      subtotalCents,
+      taxTotalCents,
+      totalCents: subtotalCents + taxTotalCents + (invoiceRow?.tipCents ?? 0),
+      updatedAt: new Date(),
+    })
+    .where(eq(invoices.id, invoiceId));
+}
+
+function recalculateMockInvoiceTotals(invoice: InvoiceWithDetails): void {
+  invoice.subtotalCents = invoice.items.reduce((sum, item) => sum + item.subtotalCents, 0);
+  invoice.taxTotalCents = invoice.items.reduce((sum, item) => sum + item.taxAmountCents, 0);
+  invoice.totalCents = invoice.subtotalCents + invoice.taxTotalCents + invoice.tipCents;
+  invoice.updatedAt = new Date();
+}
+
+export interface AddInvoiceItemInput {
+  catalogItemId: string;
+  quantity: number;
+  employeeId?: string | null;
+  employeeName?: string | null;
+}
+
+// 4.4: search-and-add a product/service to an existing (open) invoice.
+export async function addInvoiceItem(
+  invoiceId: string,
+  input: AddInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const catalogItem = await getCatalogItem(input.catalogItemId);
+  if (!catalogItem || !catalogItem.active) {
+    throw new CatalogItemNotFoundError(input.catalogItemId);
+  }
+
+  if (!isDatabaseConfigured) {
+    return addInvoiceItemMock(invoice, catalogItem, input);
+  }
+  return addInvoiceItemReal(invoiceId, catalogItem, input);
+}
+
+function priceNewLine(catalogItem: CatalogItem, quantity: number, taxProfiles: Tax[]) {
+  const applicableTaxes = selectApplicableTaxes(taxProfiles, {
+    itemType: catalogItem.itemType,
+    ...DEFAULT_TAX_JURISDICTION,
+    taxExempt: catalogItem.taxExempt,
+  });
+  const grossAmountCents = computeLineGrossAmountCents({
+    quantity,
+    unitPriceCents: catalogItem.unitPriceCents,
+    discountType: "none",
+    discountAmountCents: 0,
+    discountPercentMicros: 0,
+  });
+  return calculateLineTaxes(grossAmountCents, applicableTaxes);
+}
+
+async function addInvoiceItemMock(
+  invoice: InvoiceWithDetails,
+  catalogItem: CatalogItem,
+  input: AddInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const taxProfiles = await listTaxes();
+  const taxCalc = priceNewLine(catalogItem, input.quantity, taxProfiles);
+  const nextLineNumber = Math.max(0, ...invoice.items.map((item) => item.lineNumber)) + 1;
+  const itemId = randomUUID();
+  const now = new Date();
+
+  const newItem: InvoiceItem & { taxes: InvoiceItemTax[] } = {
+    id: itemId,
+    invoiceId: invoice.id,
+    lineNumber: nextLineNumber,
+    itemType: catalogItem.itemType,
+    catalogItemId: catalogItem.id,
+    description: catalogItem.name,
+    employeeId: input.employeeId ?? null,
+    employeeName: input.employeeName ?? null,
+    quantity: input.quantity,
+    unitPriceCents: catalogItem.unitPriceCents,
+    discountType: "none",
+    discountAmountCents: 0,
+    discountPercentMicros: 0,
+    packageRedemptionId: null,
+    tipCents: 0,
+    subtotalCents: taxCalc.subtotalCents,
+    taxAmountCents: taxCalc.taxAmountCents,
+    createdAt: now,
+    taxes: taxCalc.taxes.map((tax) => ({
+      id: randomUUID(),
+      invoiceItemId: itemId,
+      taxId: tax.taxId,
+      taxName: tax.taxName,
+      taxRateMicros: tax.taxRateMicros,
+      taxIncludedInPrice: tax.taxIncludedInPrice,
+      calculationOrder: tax.calculationOrder,
+      taxAmountCents: tax.taxAmountCents,
+    })),
+  };
+
+  invoice.items.push(newItem);
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function addInvoiceItemReal(
+  invoiceId: string,
+  catalogItem: CatalogItem,
+  input: AddInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  const taxProfiles = await listTaxes();
+  const taxCalc = priceNewLine(catalogItem, input.quantity, taxProfiles);
+
+  await db.transaction(async (tx) => {
+    const existingItems = await tx
+      .select({ lineNumber: invoiceItems.lineNumber })
+      .from(invoiceItems)
+      .where(eq(invoiceItems.invoiceId, invoiceId));
+    const nextLineNumber = Math.max(0, ...existingItems.map((item) => item.lineNumber)) + 1;
+
+    const [insertedItem] = await tx
+      .insert(invoiceItems)
+      .values({
+        invoiceId,
+        lineNumber: nextLineNumber,
+        itemType: catalogItem.itemType,
+        catalogItemId: catalogItem.id,
+        description: catalogItem.name,
+        employeeId: input.employeeId ?? null,
+        employeeName: input.employeeName ?? null,
+        quantity: input.quantity,
+        unitPriceCents: catalogItem.unitPriceCents,
+        subtotalCents: taxCalc.subtotalCents,
+        taxAmountCents: taxCalc.taxAmountCents,
+      })
+      .returning({ id: invoiceItems.id });
+
+    if (taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        taxCalc.taxes.map((tax) => ({
+          invoiceItemId: insertedItem.id,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after adding a line`);
+  }
+  return updated;
+}
+
+export interface UpdateInvoiceItemInput {
+  quantity?: number;
+  discountType?: DiscountType;
+  discountAmountCents?: number;
+  discountPercentMicros?: number;
+}
+
+interface ResolvedLineUpdate {
+  quantity: number;
+  discountType: DiscountType;
+  discountAmountCents: number;
+  discountPercentMicros: number;
+  taxCalc: LineTaxCalculation;
+}
+
+// 4.4: change a line's quantity and/or discount on an open invoice. Reprices
+// against the SAME taxes that applied when the line was added (taxRateInputsFromSnapshot),
+// not whatever the taxes table says today — see db/schema.ts's
+// taxIncludedInPrice comment for why that distinction matters.
+export async function updateInvoiceItem(
+  invoiceId: string,
+  itemId: string,
+  input: UpdateInvoiceItemInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const currentItem = invoice.items.find((item) => item.id === itemId);
+  if (!currentItem) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+  if (currentItem.packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+  }
+
+  const quantity = input.quantity ?? currentItem.quantity;
+  const discountType = input.discountType ?? currentItem.discountType;
+  // Switching discount type clears the field that no longer applies, rather
+  // than leaving a stale amount/percent sitting unused on the row.
+  const discountAmountCents =
+    discountType === "amount" ? (input.discountAmountCents ?? currentItem.discountAmountCents) : 0;
+  const discountPercentMicros =
+    discountType === "percent" ? (input.discountPercentMicros ?? currentItem.discountPercentMicros) : 0;
+
+  const grossAmountCents = computeLineGrossAmountCents({
+    quantity,
+    unitPriceCents: currentItem.unitPriceCents,
+    discountType,
+    discountAmountCents,
+    discountPercentMicros,
+  });
+  const taxCalc = calculateLineTaxes(grossAmountCents, taxRateInputsFromSnapshot(currentItem.taxes));
+
+  const resolved: ResolvedLineUpdate = { quantity, discountType, discountAmountCents, discountPercentMicros, taxCalc };
+
+  if (!isDatabaseConfigured) {
+    return updateInvoiceItemMock(invoice, currentItem, resolved);
+  }
+  return updateInvoiceItemReal(invoiceId, itemId, resolved);
+}
+
+function updateInvoiceItemMock(
+  invoice: InvoiceWithDetails,
+  item: InvoiceItem & { taxes: InvoiceItemTax[] },
+  next: ResolvedLineUpdate
+): InvoiceWithDetails {
+  item.quantity = next.quantity;
+  item.discountType = next.discountType;
+  item.discountAmountCents = next.discountAmountCents;
+  item.discountPercentMicros = next.discountPercentMicros;
+  item.subtotalCents = next.taxCalc.subtotalCents;
+  item.taxAmountCents = next.taxCalc.taxAmountCents;
+  item.taxes = next.taxCalc.taxes.map((tax) => ({
+    id: randomUUID(),
+    invoiceItemId: item.id,
+    taxId: tax.taxId,
+    taxName: tax.taxName,
+    taxRateMicros: tax.taxRateMicros,
+    taxIncludedInPrice: tax.taxIncludedInPrice,
+    calculationOrder: tax.calculationOrder,
+    taxAmountCents: tax.taxAmountCents,
+  }));
+
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function updateInvoiceItemReal(
+  invoiceId: string,
+  itemId: string,
+  next: ResolvedLineUpdate
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    await tx
+      .update(invoiceItems)
+      .set({
+        quantity: next.quantity,
+        discountType: next.discountType,
+        discountAmountCents: next.discountAmountCents,
+        discountPercentMicros: next.discountPercentMicros,
+        subtotalCents: next.taxCalc.subtotalCents,
+        taxAmountCents: next.taxCalc.taxAmountCents,
+      })
+      .where(eq(invoiceItems.id, itemId));
+
+    await tx.delete(invoiceItemTaxes).where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+
+    if (next.taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        next.taxCalc.taxes.map((tax) => ({
+          invoiceItemId: itemId,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after updating a line`);
+  }
+  return updated;
+}
+
+// 4.4: "Possibilité de supprimer une ligne (tant que la facture n'est pas
+// fermée)". Line numbers are left with gaps after a removal rather than
+// renumbered — nothing depends on them being contiguous, and renumbering
+// would just be extra writes for no benefit.
+export async function removeInvoiceItem(invoiceId: string, itemId: string): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const itemIndex = invoice.items.findIndex((item) => item.id === itemId);
+  if (itemIndex === -1) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+  if (invoice.items[itemIndex].packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+  }
+
+  if (!isDatabaseConfigured) {
+    invoice.items.splice(itemIndex, 1);
+    recalculateMockInvoiceTotals(invoice);
+    return invoice;
+  }
+
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    // invoice_item_taxes rows cascade with the invoice_items row (db/schema.ts).
+    await tx.delete(invoiceItems).where(eq(invoiceItems.id, itemId));
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after removing a line`);
+  }
+  return updated;
+}
+
+export interface RecordPaymentInput {
+  method: PaymentMethod;
+  amountCents: number;
+  // cash/interac only — validated at the route layer, trusted here.
+  amountTenderedCents?: number | null;
+  reference?: string | null;
+}
+
+// 4.7/4.8: register one payment (of possibly several — split payment) on an
+// open invoice. Recomputes status from the actual sum of completed payments
+// rather than incrementing a counter, same "never trust a running total"
+// principle as recalculateInvoiceTotalsReal/Mock for line totals.
+export async function recordPayment(
+  invoiceId: string,
+  input: RecordPaymentInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = await getInvoice(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    return recordPaymentMock(invoice, input);
+  }
+
+  return recordPaymentReal(invoiceId, input);
+}
+
+function recordPaymentMock(invoice: InvoiceWithDetails, input: RecordPaymentInput): InvoiceWithDetails {
+  assertInvoicePayable(invoice);
+
+  const paidSoFar = invoice.payments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const remainingBalanceCents = invoice.totalCents - paidSoFar;
+
+  if (input.amountCents > remainingBalanceCents) {
+    throw new PaymentExceedsBalanceError(invoice.id, input.amountCents, remainingBalanceCents);
+  }
+
+  const now = new Date();
+  const changeGivenCents =
+    input.amountTenderedCents != null ? input.amountTenderedCents - input.amountCents : null;
+  const nextStatus: InvoiceStatus =
+    paidSoFar + input.amountCents >= invoice.totalCents ? "paid" : "partially_paid";
+
+  const payment: Payment = {
+    id: randomUUID(),
+    invoiceId: invoice.id,
+    method: input.method,
+    status: "completed",
+    amountCents: input.amountCents,
+    amountTenderedCents: input.amountTenderedCents ?? null,
+    changeGivenCents,
+    reference: input.reference ?? null,
+    createdAt: now,
+  };
+
+  invoice.payments.push(payment);
+  invoice.status = nextStatus;
+  if (nextStatus === "paid") {
+    invoice.paidAt = now;
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function recordPaymentReal(
+  invoiceId: string,
+  input: RecordPaymentInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+  const now = new Date();
+
+  await db.transaction(async (tx) => {
+    // Locks the invoice row for the rest of this transaction: a second
+    // concurrent payment on the same invoice blocks here until this one
+    // commits, so two payments can never both read the same "before"
+    // balance and together overshoot the invoice total.
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoicePayable(invoiceRow);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const paidSoFar = existingPayments
+      .filter((payment) => payment.status === "completed")
+      .reduce((sum, payment) => sum + payment.amountCents, 0);
+    const remainingBalanceCents = invoiceRow.totalCents - paidSoFar;
+
+    if (input.amountCents > remainingBalanceCents) {
+      throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+    }
+
+    const changeGivenCents =
+      input.amountTenderedCents != null ? input.amountTenderedCents - input.amountCents : null;
+    const nextStatus: InvoiceStatus =
+      paidSoFar + input.amountCents >= invoiceRow.totalCents ? "paid" : "partially_paid";
+
+    await tx.insert(payments).values({
+      invoiceId,
+      method: input.method,
+      status: "completed",
+      amountCents: input.amountCents,
+      amountTenderedCents: input.amountTenderedCents ?? null,
+      changeGivenCents,
+      reference: input.reference ?? null,
+    });
+
+    const updateFields: Partial<typeof invoices.$inferInsert> = { status: nextStatus, updatedAt: now };
+    if (nextStatus === "paid") {
+      updateFields.paidAt = now;
+    }
+    await tx.update(invoices).set(updateFields).where(eq(invoices.id, invoiceId));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after recording a payment`);
+  }
+  return updated;
+}
+
+// 7.4 / 11: "Facture jamais ouverte → Changer statut → voided." No payment
+// ever existed on a voidable invoice (see VOIDABLE_INVOICE_STATUSES), so
+// unlike refundInvoice there's no balance to check — this is a pure status
+// flip.
+export async function voidInvoice(invoiceId: string): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = getMockInvoiceById(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceVoidable(invoice);
+
+    const now = new Date();
+    invoice.status = "voided";
+    invoice.voidedAt = now;
+    invoice.updatedAt = now;
+    return invoice;
+  }
+
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    // Same row-lock reasoning as recordPaymentReal: stops a concurrent
+    // payment/void racing against this one.
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceVoidable(invoiceRow);
+
+    const now = new Date();
+    await tx.update(invoices).set({ status: "voided", voidedAt: now, updatedAt: now }).where(eq(invoices.id, invoiceId));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after voiding`);
+  }
+  return updated;
+}
+
+export interface RefundInvoiceInput {
+  amountCents: number;
+  reason?: string | null;
+}
+
+function netPaidCents(
+  invoicePayments: { amountCents: number; status: string }[],
+  invoiceRefunds: { amountCents: number }[]
+): number {
+  const paidSoFar = invoicePayments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const refundedSoFar = invoiceRefunds.reduce((sum, refund) => sum + refund.amountCents, 0);
+  return paidSoFar - refundedSoFar;
+}
+
+// 7.4 / 11: "Facture payée, erreur détectée → Créer un Refund lié à la
+// facture originale." A refund is its own ledger row (db/schema.ts's
+// refunds table), not a flag on a payment — "net paid" (what's refundable)
+// is recomputed from payments minus refunds every time, same "never trust a
+// running total" principle as recalculateInvoiceTotalsReal/Mock. The
+// requis doc's status table (4.3) has no "partially_refunded" state, so
+// only a refund that exactly exhausts what's still net-paid flips the
+// invoice to 'refunded'; a smaller, partial refund leaves status untouched
+// and is tracked purely through the refunds rows themselves.
+export async function refundInvoice(
+  invoiceId: string,
+  input: RefundInvoiceInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    const invoice = getMockInvoiceById(invoiceId);
+    if (!invoice) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    return refundInvoiceMock(invoice, input);
+  }
+
+  return refundInvoiceReal(invoiceId, input);
+}
+
+function refundInvoiceMock(invoice: InvoiceWithDetails, input: RefundInvoiceInput): InvoiceWithDetails {
+  assertInvoiceRefundable(invoice);
+
+  const maxRefundableCents = netPaidCents(invoice.payments, invoice.refunds);
+  if (input.amountCents > maxRefundableCents) {
+    throw new RefundExceedsNetPaidError(invoice.id, input.amountCents, maxRefundableCents);
+  }
+
+  const now = new Date();
+  const refund: Refund = {
+    id: randomUUID(),
+    invoiceId: invoice.id,
+    amountCents: input.amountCents,
+    reason: input.reason ?? null,
+    createdAt: now,
+  };
+
+  invoice.refunds.push(refund);
+  if (input.amountCents === maxRefundableCents) {
+    invoice.status = "refunded";
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function refundInvoiceReal(invoiceId: string, input: RefundInvoiceInput): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceRefundable(invoiceRow);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const existingRefunds = await tx
+      .select({ amountCents: refunds.amountCents })
+      .from(refunds)
+      .where(eq(refunds.invoiceId, invoiceId));
+
+    const maxRefundableCents = netPaidCents(existingPayments, existingRefunds);
+    if (input.amountCents > maxRefundableCents) {
+      throw new RefundExceedsNetPaidError(invoiceId, input.amountCents, maxRefundableCents);
+    }
+
+    await tx.insert(refunds).values({
+      invoiceId,
+      amountCents: input.amountCents,
+      reason: input.reason ?? null,
+    });
+
+    if (input.amountCents === maxRefundableCents) {
+      await tx
+        .update(invoices)
+        .set({ status: "refunded", updatedAt: new Date() })
+        .where(eq(invoices.id, invoiceId));
+    }
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after refunding`);
+  }
+  return updated;
+}
+
+export interface SetInvoiceTipInput {
+  mode: TipMode;
+  amountCents?: number;
+  percent?: number;
+  base?: TipBase; // only meaningful when mode === 'percent'; defaults to pre_tax
+  distribution: TipDistribution;
+  manualAmounts?: ManualTipAmount[];
+}
+
+// 4.6: set (or replace) the invoice's tip and prorate it across eligible
+// lines. Same editability gate as line edits (draft/unpaid only) — changing
+// the tip after a payment exists has the same "invalidates solde restant"
+// problem. A one-shot calculation: adding a line after the tip is set does
+// NOT retroactively reprorate it — call this again if that's needed.
+export async function setInvoiceTip(
+  invoiceId: string,
+  input: SetInvoiceTipInput
+): Promise<InvoiceWithDetails> {
+  const invoice = await getInvoice(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const eligibleLines = invoice.items
+    .filter((item): item is typeof item & { employeeId: string } => item.itemType === "service" && item.employeeId !== null)
+    .map((item) => ({ lineId: item.id, employeeId: item.employeeId, valueCents: item.subtotalCents }));
+
+  if (eligibleLines.length === 0) {
+    throw new NoTipEligibleLinesError(invoiceId);
+  }
+
+  const tipTotalCents = computeTipTotalCents({
+    mode: input.mode,
+    amountCents: input.amountCents,
+    percent: input.percent,
+    base: input.base ?? "pre_tax",
+    subtotalCents: invoice.subtotalCents,
+    taxTotalCents: invoice.taxTotalCents,
+  });
+
+  const lineTips = prorateTip(tipTotalCents, eligibleLines, input.distribution, input.manualAmounts);
+  const tipByLineId = new Map(lineTips.map((result) => [result.lineId, result.tipCents]));
+
+  if (!isDatabaseConfigured) {
+    return setInvoiceTipMock(invoice, tipTotalCents, tipByLineId);
+  }
+  return setInvoiceTipReal(invoiceId, tipTotalCents, tipByLineId);
+}
+
+function setInvoiceTipMock(
+  invoice: InvoiceWithDetails,
+  tipTotalCents: number,
+  tipByLineId: Map<string, number>
+): InvoiceWithDetails {
+  for (const item of invoice.items) {
+    item.tipCents = tipByLineId.get(item.id) ?? 0;
+  }
+  invoice.tipCents = tipTotalCents;
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function setInvoiceTipReal(
+  invoiceId: string,
+  tipTotalCents: number,
+  tipByLineId: Map<string, number>
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    for (const [lineId, tipCents] of tipByLineId) {
+      await tx.update(invoiceItems).set({ tipCents }).where(eq(invoiceItems.id, lineId));
+    }
+    await tx.update(invoices).set({ tipCents: tipTotalCents }).where(eq(invoices.id, invoiceId));
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after setting tip`);
+  }
+  return updated;
+}
+
+export interface RedeemGiftCardInput {
+  code: string;
+  amountCents: number;
+}
+
+// 4.9: a gift card redemption is a payment (method 'gift_card') AND a
+// balance deduction happening together — if those aren't atomic, a crash
+// between them either records a payment with nothing backing it or drains
+// a card with no payment on the invoice. The real branch locks BOTH the
+// invoice row and the gift card row in one transaction (same technique as
+// recordPayment's overpayment race guard, extended to a second resource),
+// so two concurrent redemptions can never both read the same "before"
+// state and double-spend either the invoice's balance or the card's.
+export async function redeemGiftCard(
+  invoiceId: string,
+  input: RedeemGiftCardInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    return redeemGiftCardMock(invoiceId, input);
+  }
+  return redeemGiftCardReal(invoiceId, input);
+}
+
+function redeemGiftCardMock(invoiceId: string, input: RedeemGiftCardInput): InvoiceWithDetails {
+  const invoice = getMockInvoiceById(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoicePayable(invoice);
+
+  const giftCard = getMockGiftCardByCode(input.code);
+  if (!giftCard) {
+    throw new GiftCardNotFoundError(input.code);
+  }
+  assertGiftCardRedeemable(giftCard, input.amountCents);
+
+  const paidSoFar = invoice.payments
+    .filter((payment) => payment.status === "completed")
+    .reduce((sum, payment) => sum + payment.amountCents, 0);
+  const remainingBalanceCents = invoice.totalCents - paidSoFar;
+
+  if (input.amountCents > remainingBalanceCents) {
+    throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+  }
+
+  const now = new Date();
+  const nextStatus: InvoiceStatus =
+    paidSoFar + input.amountCents >= invoice.totalCents ? "paid" : "partially_paid";
+
+  giftCard.remainingBalanceCents -= input.amountCents;
+  if (giftCard.remainingBalanceCents <= 0) {
+    giftCard.status = "depleted";
+  }
+  giftCard.updatedAt = now;
+
+  invoice.payments.push({
+    id: randomUUID(),
+    invoiceId,
+    method: "gift_card",
+    status: "completed",
+    amountCents: input.amountCents,
+    amountTenderedCents: null,
+    changeGivenCents: null,
+    reference: input.code,
+    createdAt: now,
+  });
+  invoice.status = nextStatus;
+  if (nextStatus === "paid") {
+    invoice.paidAt = now;
+  }
+  invoice.updatedAt = now;
+
+  return invoice;
+}
+
+async function redeemGiftCardReal(
+  invoiceId: string,
+  input: RedeemGiftCardInput
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoicePayable(invoiceRow);
+
+    const [giftCardRow] = await tx
+      .select()
+      .from(giftCardsTable)
+      .where(eq(giftCardsTable.code, input.code))
+      .for("update");
+    if (!giftCardRow) {
+      throw new GiftCardNotFoundError(input.code);
+    }
+    assertGiftCardRedeemable(giftCardRow, input.amountCents);
+
+    const existingPayments = await tx
+      .select({ amountCents: payments.amountCents, status: payments.status })
+      .from(payments)
+      .where(eq(payments.invoiceId, invoiceId));
+    const paidSoFar = existingPayments
+      .filter((payment) => payment.status === "completed")
+      .reduce((sum, payment) => sum + payment.amountCents, 0);
+    const remainingBalanceCents = invoiceRow.totalCents - paidSoFar;
+
+    if (input.amountCents > remainingBalanceCents) {
+      throw new PaymentExceedsBalanceError(invoiceId, input.amountCents, remainingBalanceCents);
+    }
+
+    const now = new Date();
+    const nextStatus: InvoiceStatus =
+      paidSoFar + input.amountCents >= invoiceRow.totalCents ? "paid" : "partially_paid";
+
+    await tx.insert(payments).values({
+      invoiceId,
+      method: "gift_card",
+      status: "completed",
+      amountCents: input.amountCents,
+      reference: input.code,
+    });
+
+    const invoiceUpdateFields: Partial<typeof invoices.$inferInsert> = {
+      status: nextStatus,
+      updatedAt: now,
+    };
+    if (nextStatus === "paid") {
+      invoiceUpdateFields.paidAt = now;
+    }
+    await tx.update(invoices).set(invoiceUpdateFields).where(eq(invoices.id, invoiceId));
+
+    const nextGiftCardBalanceCents = giftCardRow.remainingBalanceCents - input.amountCents;
+    const giftCardUpdateFields: Partial<typeof giftCardsTable.$inferInsert> = {
+      remainingBalanceCents: nextGiftCardBalanceCents,
+      updatedAt: now,
+    };
+    if (nextGiftCardBalanceCents <= 0) {
+      giftCardUpdateFields.status = "depleted";
+    }
+    await tx.update(giftCardsTable).set(giftCardUpdateFields).where(eq(giftCardsTable.id, giftCardRow.id));
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after redeeming a gift card`);
+  }
+  return updated;
+}
+
+export interface RedeemPackageForLineInput {
+  packageId: string;
+}
+
+// 4.10: unlike a gift card, this isn't a payment — the line itself becomes
+// free. Reuses the exact discount mechanism updateInvoiceItem already has
+// (100%-of-value 'amount' discount) rather than inventing new pricing math,
+// so tax/subtotal recompute for free. Locks the invoice_items row, the
+// packages row, and the package_items row in one transaction (real branch)
+// — same reasoning as redeemGiftCard, extended to three resources instead
+// of two, since a package redemption touches the invoice's line AND the
+// package's own state.
+export async function redeemPackageForLine(
+  invoiceId: string,
+  itemId: string,
+  input: RedeemPackageForLineInput
+): Promise<InvoiceWithDetails> {
+  if (!isDatabaseConfigured) {
+    return redeemPackageForLineMock(invoiceId, itemId, input.packageId);
+  }
+  return redeemPackageForLineReal(invoiceId, itemId, input.packageId);
+}
+
+function assertPackageActive(pkg: { id: string; status: string; expiresAt: Date | null }): void {
+  const isExpired = pkg.expiresAt !== null && pkg.expiresAt.getTime() < Date.now();
+  if (isExpired || pkg.status === "expired") {
+    throw new PackageNotActiveError(pkg.id, "expired");
+  }
+  if (pkg.status === "completed") {
+    throw new PackageNotActiveError(pkg.id, "completed");
+  }
+}
+
+function redeemPackageForLineMock(invoiceId: string, itemId: string, packageId: string): InvoiceWithDetails {
+  const invoice = getMockInvoiceById(invoiceId);
+  if (!invoice) {
+    throw new InvoiceNotFoundError(invoiceId);
+  }
+  assertInvoiceEditable(invoice);
+
+  const item = invoice.items.find((line) => line.id === itemId);
+  if (!item) {
+    throw new InvoiceItemNotFoundError(invoiceId, itemId);
+  }
+  if (item.packageRedemptionId) {
+    throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+  }
+  if (!item.catalogItemId) {
+    throw new PackageItemNotFoundError(packageId, "unknown");
+  }
+
+  const pkg = getMockPackageById(packageId);
+  if (!pkg) {
+    throw new PackageNotFoundError(packageId);
+  }
+  if (pkg.customerId !== invoice.customerId) {
+    throw new PackageCustomerMismatchError(packageId, invoiceId);
+  }
+  assertPackageActive(pkg);
+
+  const packageItemsForPackage = getMockPackageItemsByPackageId(packageId);
+  const packageItem = packageItemsForPackage.find((pi) => pi.catalogItemId === item.catalogItemId);
+  if (!packageItem) {
+    throw new PackageItemNotFoundError(packageId, item.catalogItemId);
+  }
+  if (packageItem.remainingQuantity < item.quantity) {
+    throw new PackageInsufficientQuantityError(
+      packageId,
+      item.catalogItemId,
+      item.quantity,
+      packageItem.remainingQuantity
+    );
+  }
+
+  const rawCents = item.quantity * item.unitPriceCents;
+  const taxCalc = calculateLineTaxes(0, taxRateInputsFromSnapshot(item.taxes));
+
+  item.discountType = "amount";
+  item.discountAmountCents = rawCents;
+  item.discountPercentMicros = 0;
+  item.packageRedemptionId = packageItem.id;
+  item.subtotalCents = taxCalc.subtotalCents;
+  item.taxAmountCents = taxCalc.taxAmountCents;
+  item.taxes = taxCalc.taxes.map((tax) => ({
+    id: randomUUID(),
+    invoiceItemId: item.id,
+    taxId: tax.taxId,
+    taxName: tax.taxName,
+    taxRateMicros: tax.taxRateMicros,
+    taxIncludedInPrice: tax.taxIncludedInPrice,
+    calculationOrder: tax.calculationOrder,
+    taxAmountCents: tax.taxAmountCents,
+  }));
+
+  packageItem.remainingQuantity -= item.quantity;
+
+  const allDepleted = packageItemsForPackage.every((pi) => pi.remainingQuantity <= 0);
+  if (allDepleted) {
+    pkg.status = "completed";
+    pkg.updatedAt = new Date();
+  }
+
+  recalculateMockInvoiceTotals(invoice);
+  return invoice;
+}
+
+async function redeemPackageForLineReal(
+  invoiceId: string,
+  itemId: string,
+  packageId: string
+): Promise<InvoiceWithDetails> {
+  const db = getDb();
+
+  await db.transaction(async (tx) => {
+    const [invoiceRow] = await tx.select().from(invoices).where(eq(invoices.id, invoiceId)).for("update");
+    if (!invoiceRow) {
+      throw new InvoiceNotFoundError(invoiceId);
+    }
+    assertInvoiceEditable(invoiceRow);
+
+    const [itemRow] = await tx
+      .select()
+      .from(invoiceItems)
+      .where(and(eq(invoiceItems.id, itemId), eq(invoiceItems.invoiceId, invoiceId)))
+      .for("update");
+    if (!itemRow) {
+      throw new InvoiceItemNotFoundError(invoiceId, itemId);
+    }
+    if (itemRow.packageRedemptionId) {
+      throw new InvoiceItemAlreadyRedeemedError(invoiceId, itemId);
+    }
+    if (!itemRow.catalogItemId) {
+      throw new PackageItemNotFoundError(packageId, "unknown");
+    }
+
+    const [packageRow] = await tx
+      .select()
+      .from(packagesTable)
+      .where(eq(packagesTable.id, packageId))
+      .for("update");
+    if (!packageRow) {
+      throw new PackageNotFoundError(packageId);
+    }
+    if (packageRow.customerId !== invoiceRow.customerId) {
+      throw new PackageCustomerMismatchError(packageId, invoiceId);
+    }
+    assertPackageActive(packageRow);
+
+    const [packageItemRow] = await tx
+      .select()
+      .from(packageItemsTable)
+      .where(
+        and(eq(packageItemsTable.packageId, packageId), eq(packageItemsTable.catalogItemId, itemRow.catalogItemId))
+      )
+      .for("update");
+    if (!packageItemRow) {
+      throw new PackageItemNotFoundError(packageId, itemRow.catalogItemId);
+    }
+    if (packageItemRow.remainingQuantity < itemRow.quantity) {
+      throw new PackageInsufficientQuantityError(
+        packageId,
+        itemRow.catalogItemId,
+        itemRow.quantity,
+        packageItemRow.remainingQuantity
+      );
+    }
+
+    const existingTaxes = await tx
+      .select()
+      .from(invoiceItemTaxes)
+      .where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+    const taxCalc = calculateLineTaxes(0, taxRateInputsFromSnapshot(existingTaxes));
+    const rawCents = itemRow.quantity * itemRow.unitPriceCents;
+
+    await tx
+      .update(invoiceItems)
+      .set({
+        discountType: "amount",
+        discountAmountCents: rawCents,
+        discountPercentMicros: 0,
+        packageRedemptionId: packageItemRow.id,
+        subtotalCents: taxCalc.subtotalCents,
+        taxAmountCents: taxCalc.taxAmountCents,
+      })
+      .where(eq(invoiceItems.id, itemId));
+
+    await tx.delete(invoiceItemTaxes).where(eq(invoiceItemTaxes.invoiceItemId, itemId));
+    if (taxCalc.taxes.length > 0) {
+      await tx.insert(invoiceItemTaxes).values(
+        taxCalc.taxes.map((tax) => ({
+          invoiceItemId: itemId,
+          taxId: tax.taxId,
+          taxName: tax.taxName,
+          taxRateMicros: tax.taxRateMicros,
+          taxIncludedInPrice: tax.taxIncludedInPrice,
+          calculationOrder: tax.calculationOrder,
+          taxAmountCents: tax.taxAmountCents,
+        }))
+      );
+    }
+
+    await recalculateInvoiceTotalsReal(tx, invoiceId);
+
+    const nextRemainingQuantity = packageItemRow.remainingQuantity - itemRow.quantity;
+    await tx
+      .update(packageItemsTable)
+      .set({ remainingQuantity: nextRemainingQuantity })
+      .where(eq(packageItemsTable.id, packageItemRow.id));
+
+    const siblingItems = await tx
+      .select({ id: packageItemsTable.id, remainingQuantity: packageItemsTable.remainingQuantity })
+      .from(packageItemsTable)
+      .where(eq(packageItemsTable.packageId, packageId));
+    const allDepleted = siblingItems.every((sibling) =>
+      sibling.id === packageItemRow.id ? nextRemainingQuantity <= 0 : sibling.remainingQuantity <= 0
+    );
+    if (allDepleted) {
+      await tx
+        .update(packagesTable)
+        .set({ status: "completed", updatedAt: new Date() })
+        .where(eq(packagesTable.id, packageId));
+    }
+  });
+
+  const updated = await getInvoice(invoiceId);
+  if (!updated) {
+    throw new Error(`Invoice ${invoiceId} disappeared after redeeming a package`);
+  }
+  return updated;
 }
