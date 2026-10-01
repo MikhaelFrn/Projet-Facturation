@@ -6,8 +6,7 @@ invoicing module**: turning a completed appointment into an invoice, adding
 products, calculating taxes, collecting payment (including split payments,
 gift cards and pre-sold packages), prorating tips, and issuing voids/refunds.
 
-It was built against a detailed requirements document
-(`opensourcepos/requis-facturation-stagiaire.md.pdf`) that also pointed at
+It was built against a detailed requirements document that also pointed at
 [OpenSourcePOS](https://opensourcepos.org/) (PHP) as a reference for invoice
 structure, tax calculation and payment handling — that project was only read
 for its data-modeling logic, never run or depended on.
@@ -81,7 +80,7 @@ This is the one thing the whole data layer is built around making trivial:
    against your database.
 4. Restart `npm run dev`.
 
-That's it — no code changes. Every feature repository (`features/*/repository.ts`)
+Every feature repository (`features/*/repository.ts`)
 checks a single flag, `isDatabaseConfigured` (`db/client.ts`), which becomes
 `true` the moment `DATABASE_URL` is set, and switches from mock arrays to
 real Drizzle queries against your database. `db/schema.ts` is the single
@@ -171,17 +170,39 @@ formatting is already genuinely locale-aware; everything else is not.
 | `npm run build` | Production build (also type-checks) |
 | `npm start` | Run a production build |
 | `npm run lint` | ESLint |
+| `npm test` | Run the test suite (Vitest, one-shot) |
+| `npx vitest` | Run the test suite in watch mode |
 | `npx tsc --noEmit` | Type-check only |
 | `npx drizzle-kit generate` | Generate a SQL migration from `db/schema.ts` |
 | `npx drizzle-kit push` | Push `db/schema.ts` directly to `DATABASE_URL` (no migration file) |
 
-There is no automated test suite yet — each feature was verified during
-development with `tsc`/`lint`/`build` plus standalone scripts run via
-`npx tsx` against the repository functions directly, and live `curl` checks
-against a running dev server. Adding real tests (e.g. around
-`tax-calculation.ts`, `tip-calculation.ts`, and the invoice status-transition
-guards in `features/invoicing/repository.ts`) would be a good next step for
-anyone extending this.
+### Tests
+
+Unit tests run with [Vitest](https://vitest.dev/) (`vitest.config.ts`), live
+next to the code they cover as `*.test.ts`, and never touch a real database
+— everything runs against mock data, so `npm test` needs no `DATABASE_URL`
+and nothing provisioned. Coverage is in three tiers:
+
+- **Pure calculation modules** — `tax-calculation.ts`, `tip-calculation.ts`,
+  `checkout-view.ts`'s aggregations, `utils/currency.ts`. No mocking; inputs
+  in, numbers out, several checked directly against the requirements doc's
+  own worked examples.
+- **Invoicing repository business rules**, in mock mode — the invoice
+  status-transition guards, split payments and overpay rejection, void/
+  refund across every status, gift card and package redemption (balance/
+  quantity/expiry/customer-mismatch edge cases), and the already-redeemed
+  line lockout. Repository functions mutate shared in-memory mock arrays in
+  place, so each relevant `features/*/mock-data.ts` exports a test-only
+  `resetMockX()` (snapshot-and-restore via `structuredClone`), called from
+  `beforeEach` to keep test cases isolated from one another.
+- **A representative sample of route handlers** — not all of them, since the
+  tier above already covers the business logic they delegate to. Next.js
+  route handlers are just functions, so these call the exported
+  `GET`/`POST` directly with a constructed `Request`, no running server
+  needed, to verify request validation and error→HTTP-status mapping.
+
+There's no component-level UI testing yet (`CheckoutScreen` and friends) —
+that would need jsdom and Testing Library, which isn't set up here.
 
 ## Architecture
 
